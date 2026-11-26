@@ -41,6 +41,7 @@ from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding, stats_tracker
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.errors import ModelExecutionTimeoutError
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, gethostip
@@ -331,8 +332,9 @@ app = FastAPI()
 
 
 @app.exception_handler(InvalidToolCallError)
+@app.exception_handler(ModelExecutionTimeoutError)
 async def invalid_tool_call_error_response(
-    _request: Request, exc: InvalidToolCallError
+    _request: Request, exc: InvalidToolCallError | ModelExecutionTimeoutError
 ) -> JSONResponse:
     """Return a protocol-native, explicitly non-retryable model error."""
     return JSONResponse(
@@ -352,6 +354,9 @@ async def invalid_tool_call_error_response(
 def _reject_retry_after_invalid_tool_call(session_id: str) -> None:
     with _lock:
         invalid_tool_error = _session_invalid_tool_errors.get(session_id)
+        session = _session_cache.get(session_id)
+    if session is not None and session.model_execution_timeout:
+        raise ModelExecutionTimeoutError()
     if invalid_tool_error is not None:
         logger.warning(
             "Rejecting retry for session %s after invalid tool JSON", session_id
@@ -750,6 +755,7 @@ async def end_session(session_id: str = Depends(_require_session_key)):
         "invalid_tool_json_message": invalid_tool_json_message,
         "system_error": session.system_error,
         "system_error_message": session.system_error_message,
+        "model_execution_timeout": session.recoverable_model_execution_timeout,
     }
 
 
@@ -1216,6 +1222,7 @@ async def _call_client_create(
     if stream:
         kwargs["stream"] = True
 
+    session_data.begin_model_request()
     try:
         client_kwargs: dict[str, Any] = {
             "areal_cache": session_data.completions,
@@ -1227,6 +1234,10 @@ async def _call_client_create(
             _engine, session_data.backend_session_id, close=False
         ):
             return await create_fn(**client_kwargs)
+    except ModelExecutionTimeoutError:
+        session_data.mark_model_execution_timeout()
+        logger.warning("Session %s exceeded the model running timeout", session_id)
+        raise
     except RoutingError as e:
         session_data.mark_system_error(str(e))
         # 409 is intentionally not an SDK-transparent retry status. A metadata
@@ -1274,6 +1285,8 @@ async def _call_client_create(
         session_data.mark_system_error(f"{type(e).__name__}: {e}")
         logger.exception("AReaL client request failed")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    finally:
+        session_data.end_model_request()
 
 
 @app.post(
@@ -1407,13 +1420,13 @@ async def _deferred_openai_sse_stream(
         yield "data: [DONE]\n\n"
     except asyncio.CancelledError:
         raise
-    except InvalidToolCallError as exc:
+    except (InvalidToolCallError, ModelExecutionTimeoutError) as exc:
         # The HTTP response has already started so the FastAPI exception
         # handler cannot return its 422 response here. Preserve the same
         # non-retryable error semantics in the OpenAI SSE payload; otherwise
         # downstream gateways classify this as a retryable server_error and
         # Claude Code silently retries the malformed model action.
-        logger.warning("Ending stream after invalid tool JSON: %s", exc)
+        logger.warning("Ending stream after non-retryable model failure: %s", exc)
         error = {
             "error": {
                 "message": str(exc),
@@ -1628,7 +1641,7 @@ async def anthropic_messages(
                     "X-Accel-Buffering": "no",
                 },
             )
-        except (HTTPException, InvalidToolCallError):
+        except (HTTPException, InvalidToolCallError, ModelExecutionTimeoutError):
             raise
         except Exception as e:
             # Clean up stream on error during setup

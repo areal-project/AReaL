@@ -18,6 +18,7 @@ from areal.experimental.openai.finalization import (
     finalize_interactions,
     response_validator_for_policy,
 )
+from areal.utils.errors import ModelExecutionTimeoutError
 
 if TYPE_CHECKING:
     from areal.experimental.openai.types import InteractionWithTokenLogpReward
@@ -165,6 +166,9 @@ class SessionData:
         self.context_overflow_message = ""
         self.system_error = False
         self.system_error_message = ""
+        self.model_execution_timeout = False
+        self._active_model_requests = 0
+        self._concurrent_model_requests = False
         self._next_sampling_request_index = 0
         self._processor_cache_released = False
 
@@ -217,6 +221,33 @@ class SessionData:
             self.system_error = True
             if not self.system_error_message:
                 self.system_error_message = message
+
+    def begin_model_request(self) -> None:
+        """Fence retries after a confirmed model timeout and track ambiguity."""
+        with self._lock:
+            if self.model_execution_timeout:
+                raise ModelExecutionTimeoutError()
+            if self._active_model_requests:
+                self._concurrent_model_requests = True
+            self._active_model_requests += 1
+
+    def end_model_request(self) -> None:
+        with self._lock:
+            self._active_model_requests -= 1
+
+    def mark_model_execution_timeout(self) -> None:
+        with self._lock:
+            self.model_execution_timeout = True
+
+    @property
+    def recoverable_model_execution_timeout(self) -> bool:
+        """Concurrent requests cannot establish a unique terminal model cause."""
+        with self._lock:
+            return (
+                self.model_execution_timeout
+                and not self._concurrent_model_requests
+                and self._active_model_requests == 0
+            )
 
     @property
     def is_completed(self) -> bool:

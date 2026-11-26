@@ -44,6 +44,7 @@ from areal.experimental.openai.tool_call_parser import InvalidToolCallError
 from areal.infra import workflow_context
 from areal.utils import logging, stats_tracker
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.errors import ModelExecutionTimeoutError
 from areal.utils.rollout_metrics import get_arena_stream_name
 
 logger = logging.getLogger("ArenaStreamAgent")
@@ -840,6 +841,11 @@ class ArenaStreamAgentWorkflow:
         This envelope alone is not model attribution: callers must also have
         the proxy's session-scoped InvalidToolCallError and a matching receipt.
         """
+        return cls._is_core_proxy_model_failure(raw, InvalidToolCallError.code)
+
+    @classmethod
+    def _is_core_proxy_model_failure(cls, raw: Any, code: str) -> bool:
+        """Recognize a proxy error envelope; local typed evidence is still required."""
         if not isinstance(raw, dict):
             return False
         outcome = raw.get("outcome")
@@ -858,8 +864,8 @@ class ArenaStreamAgentWorkflow:
             and source in {"provider_stream", "provider_http"}
             and details.get("errorShape") == "object"
             and details.get("errorType") == "invalid_request_error"
-            and details.get("code") in (None, "invalid_tool_json")
-            and details.get("reason") in (None, "invalid_tool_json")
+            and details.get("code") in (None, code)
+            and details.get("reason") in (None, code)
             and details.get("eventType")
             == ("error" if source == "provider_stream" else "http_error")
             and (source != "provider_http" or details.get("httpStatus") == 422)
@@ -945,7 +951,9 @@ class ArenaStreamAgentWorkflow:
         return terminal_error
 
     @staticmethod
-    def _core_terminal_diagnostics_match(details: Any, *, tool_failure: bool) -> bool:
+    def _core_terminal_diagnostics_match(
+        details: Any, *, tool_failure: bool, model_execution_timeout: bool = False
+    ) -> bool:
         """Reject service hints and bind legacy tool failures to the last turn."""
         if not isinstance(details, dict):
             return False
@@ -958,19 +966,33 @@ class ArenaStreamAgentWorkflow:
             )
         ):
             return False
-        if tool_failure and not (
-            details.get("code") == "invalid_tool_json"
-            or details.get("reason") == "invalid_tool_json"
+        if (
+            model_execution_timeout
+            or tool_failure
+            and not (
+                details.get("code") == "invalid_tool_json"
+                or details.get("reason") == "invalid_tool_json"
+            )
         ):
             # A session flag may refer to an earlier, completed turn. The
             # legacy Core drops our code, so bind its terminal diagnostic
             # to the exact typed proxy error instead of guessing from it.
+            expected_message = (
+                ModelExecutionTimeoutError.message.encode("utf-8")
+                if model_execution_timeout
+                else _PROXY_INVALID_TOOL_JSON_MESSAGE
+            )
+            expected_digest = (
+                hashlib.sha256(expected_message).hexdigest()
+                if model_execution_timeout
+                else _PROXY_INVALID_TOOL_JSON_SHA256
+            )
             if (
                 not isinstance(signals, dict)
-                or signals.get("messageSha256") != _PROXY_INVALID_TOOL_JSON_SHA256
+                or signals.get("messageSha256") != expected_digest
                 or any(
                     type(signals.get(field)) is not int
-                    or signals[field] != len(_PROXY_INVALID_TOOL_JSON_MESSAGE)
+                    or signals[field] != len(expected_message)
                     for field in ("messageBytes", "messageScannedChars")
                 )
             ):
@@ -1052,7 +1074,12 @@ class ArenaStreamAgentWorkflow:
 
     @classmethod
     def _is_core_agent_zero_failure(
-        cls, raw: Any, receipt: Any, *, invalid_tool_json: bool = False
+        cls,
+        raw: Any,
+        receipt: Any,
+        *,
+        invalid_tool_json: bool = False,
+        model_execution_timeout: bool = False,
     ) -> bool:
         """Match the terminal model failure, including completed continuations."""
         message = cls._core_model_zero_failure_message(raw)
@@ -1063,8 +1090,14 @@ class ArenaStreamAgentWorkflow:
             message = cls._core_context_zero_failure_message(raw)
         context_failure = cls._is_structured_context_failure(raw)
         tool_failure = invalid_tool_json and cls._is_core_invalid_tool_json_failure(raw)
+        timeout_failure = model_execution_timeout and cls._is_core_proxy_model_failure(
+            raw, ModelExecutionTimeoutError.code
+        )
         if (
-            message is None and not context_failure and not tool_failure
+            message is None
+            and not context_failure
+            and not tool_failure
+            and not timeout_failure
         ) or not isinstance(receipt, dict):
             return False
         if (
@@ -1075,14 +1108,31 @@ class ArenaStreamAgentWorkflow:
             or receipt.get("summary") != raw["harness"]["summary"]
         ):
             return False
-        if budget_message is not None and cls._has_harness_receipt_system_failure(
-            receipt
-        ):
+        if (
+            budget_message is not None or timeout_failure
+        ) and cls._has_harness_receipt_system_failure(receipt):
             return False
         terminal_error = cls._core_terminal_failure_error(receipt)
         if terminal_error is None:
             return False
         multiple_turns = len(receipt["turn_statuses"]) > 1
+        if timeout_failure:
+            details = raw["outcome"]["details"]
+
+            def label(value: str | None) -> str:
+                return "None" if value is None else f'Some("{value}")'
+
+            expected_message = (
+                "model reported a streaming error "
+                f"(event={details['eventType']}, code={label(details.get('code'))}, "
+                f"type={label(details['errorType'])}, "
+                f"reason={label(details.get('reason'))})"
+            )
+            allowed_messages = {expected_message}
+            if details["eventType"] == "http_error":
+                allowed_messages.add("model HTTP status 422")
+            if terminal_error["message"] not in allowed_messages:
+                return False
         if (
             message is not None
             and terminal_error["message"] != message
@@ -1093,8 +1143,10 @@ class ArenaStreamAgentWorkflow:
             )
         ):
             return False
-        if (tool_failure or multiple_turns) and _HARNESS_SYSTEM_ERROR_PATTERN.search(
-            terminal_error["message"]
+        if (
+            not timeout_failure
+            and (tool_failure or multiple_turns)
+            and _HARNESS_SYSTEM_ERROR_PATTERN.search(terminal_error["message"])
         ):
             return False
         expected = raw["outcome"]
@@ -1109,8 +1161,12 @@ class ArenaStreamAgentWorkflow:
                 for field in ("code", "class", "source", "details")
             ):
                 return False
-        return not multiple_turns or cls._core_terminal_diagnostics_match(
-            expected.get("details"), tool_failure=tool_failure
+        return not (
+            multiple_turns or timeout_failure
+        ) or cls._core_terminal_diagnostics_match(
+            expected.get("details"),
+            tool_failure=tool_failure,
+            model_execution_timeout=timeout_failure,
         )
 
     @staticmethod
@@ -1500,6 +1556,7 @@ class ArenaStreamAgentWorkflow:
         *,
         context_overflow: bool = False,
         invalid_tool_json: bool = False,
+        model_execution_timeout: bool = False,
     ) -> bool:
         """Select one result family, then apply only that family's admission rules."""
         result = error.result
@@ -1539,7 +1596,10 @@ class ArenaStreamAgentWorkflow:
             and result is not None
             and result.score == 0.0
             and cls._is_core_agent_zero_failure(
-                raw, error.harness_result, invalid_tool_json=invalid_tool_json
+                raw,
+                error.harness_result,
+                invalid_tool_json=invalid_tool_json,
+                model_execution_timeout=model_execution_timeout,
             )
         ):
             return True
@@ -1585,6 +1645,7 @@ class ArenaStreamAgentWorkflow:
         context_overflow: bool,
         interaction_count: int,
         invalid_tool_json: bool = False,
+        model_execution_timeout: bool = False,
     ) -> str:
         """Retain model-attributed failures using the identified Harness format.
 
@@ -1604,6 +1665,7 @@ class ArenaStreamAgentWorkflow:
                 error,
                 context_overflow=context_overflow,
                 invalid_tool_json=invalid_tool_json,
+                model_execution_timeout=model_execution_timeout,
             )
         ):
             return "model_failure_zero"
@@ -2207,6 +2269,9 @@ class ArenaStreamAgentWorkflow:
                         is not None
                         or self._is_structured_context_failure(exc.result.raw)
                         or self._is_core_invalid_tool_json_failure(exc.result.raw)
+                        or self._is_core_proxy_model_failure(
+                            exc.result.raw, ModelExecutionTimeoutError.code
+                        )
                     ):
                         try:
                             exc.harness_result = (
