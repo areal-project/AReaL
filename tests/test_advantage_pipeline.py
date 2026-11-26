@@ -341,6 +341,38 @@ def test_optional_logprob_none_remains_supported(decoupled):
     assert torch.isfinite(result["advantages"]).all()
 
 
+@pytest.mark.parametrize("reference_state", ["missing", "none"])
+def test_missing_reference_logprobs_do_not_add_surprisal_reward(reference_state):
+    """No reference policy means the KL reward stays zero, even with positive kl_ctl."""
+    data = _batch()
+    data["logprobs"] = torch.full_like(data["logprobs"], -2.0)
+    if reference_state == "none":
+        data["ref_logp"] = None
+
+    actual_data = copy.deepcopy(data)
+    expected_data = copy.deepcopy(data)
+    actual = PPOActor(PPOActorConfig(kl_ctl=0.1), engine=None)._compute_advantages(
+        actual_data
+    )
+    expected = _actor()._compute_advantages(expected_data)
+
+    torch.testing.assert_close(
+        actual["kl_rewards"], torch.zeros_like(actual["kl_rewards"])
+    )
+    torch.testing.assert_close(actual["advantages"], expected["advantages"])
+
+
+def test_explicit_zero_reference_logprobs_still_add_kl_reward():
+    """An explicit zero-valued reference tensor remains distinct from no reference."""
+    data = _batch()
+    data["logprobs"] = torch.full_like(data["logprobs"], -2.0)
+    data["ref_logp"] = torch.zeros_like(data["logprobs"])
+
+    result = PPOActor(PPOActorConfig(kl_ctl=0.1), engine=None)._compute_advantages(data)
+
+    assert torch.any(result["kl_rewards"] != 0)
+
+
 @pytest.mark.parametrize("name", ["loss_mask", "is_truncated", "input_token_loss_mask"])
 def test_plugin_masks_must_be_binary(name):
     """Fractional masks would disagree with downstream boolean support tests."""
