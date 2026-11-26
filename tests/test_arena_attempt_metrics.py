@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+from collections import Counter
 from dataclasses import asdict, replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
 from omegaconf import OmegaConf
 
-from examples.swe.arena_agent import ArenaStreamAgentWorkflow
-from examples.swe.arena_client import ArenaTaskFailedError, ArenaTaskResult
+from examples.swe.arena_agent import ArenaStreamAgentWorkflow, _error_reason_bucket
+from examples.swe.arena_client import (
+    ArenaAPIError,
+    ArenaTaskFailedError,
+    ArenaTaskResult,
+)
 from examples.swe.utils import SWEPPOConfig
 from tests.test_swe_arena_abbreviated_receipt import _error as _runner_failure_error
 from tests.test_swe_arena_multi_stream import (
@@ -18,6 +23,7 @@ from tests.test_swe_arena_multi_stream import (
     _core_tool_budget_failure_error,
 )
 
+from areal.infra.controller.rollout_controller import _merge_worker_stats
 from areal.utils.rollout_metrics import ConsumedMetrics, capture_metrics
 
 
@@ -148,6 +154,8 @@ async def test_recovered_harness_failure_export_does_not_double_count(
     assert metrics["rollout/harness_error"] == [1.0]
     assert metrics["rollout/harness_error/AGENT_MAX_TURNS_EXCEEDED"] == [1.0]
     assert metrics["rollout/task_attempt/error"] == [1.0]
+    assert metrics["rollout/error_rate/model"] == [1.0]
+    assert metrics["rollout/error_rate/model_reason/max_turns_exceeded"] == [1.0]
     assert metrics["rollout/training_score"] == [0.0]
 
 
@@ -574,3 +582,411 @@ async def test_stream_attempts_keep_independent_terminal_denominators(workflow):
     assert stats["rollout/stream/b/task_result_count"] == 1
     assert stats["rollout/stream/b/task_attempt_count"] == 2
     assert stats["rollout/task_result_count"] == 3
+
+
+def _api_failure(reason):
+    error = ArenaAPIError(reason)
+    error.arena_failure_reason = reason
+    return error
+
+
+def _terminal_failure(status, raw=None):
+    result = ArenaTaskResult(task_id="task", status=status, score=None, raw=raw)
+    return ArenaTaskFailedError(result.task_id, status, result=result)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ({"arca": {"http_status": 503}}, "arca_http_503"),
+        ({"error": "reward exec (exec_eof): EOF"}, "arca_exec_eof"),
+        (
+            {"error": "shared reward completion (exec_timeout): timeout"},
+            "arca_exec_timeout",
+        ),
+        ({"error": "adopted reward (http_5xx): failed"}, "arca_http_5xx"),
+        ({"error": "harness: model printed reward exec (exec_eof): EOF"}, None),
+        ({"error": "api_error"}, None),
+        ({"arca": {"http_status": 403}}, None),
+        (
+            {"arca": {"http_status": 403, "operation": "exec", "success": False}},
+            "arca_http_403",
+        ),
+        ({"arca": {"http_status": 403, "operation": "exec", "success": True}}, None),
+        ({"arca": {"http_status": 403, "operation": "", "success": False}}, None),
+        ({"arca": None}, None),
+        (None, None),
+    ],
+)
+def test_arena_attribution_requires_gateway_evidence(raw, expected):
+    error = _terminal_failure("FAILED", raw)
+    assert ArenaStreamAgentWorkflow._arena_failure_evidence(error) == expected
+
+
+@pytest.mark.parametrize(
+    "status,expected_origin",
+    [
+        ("SETUP_FAILED", "arena"),
+        ("COLLECT_FAILED", "arena"),
+        ("EVAL_FAILED", "arena"),
+        ("FAILED", "arena"),
+        ("ERROR", "arena"),
+        ("HARNESS_FAILED", "unknown"),
+        ("TIMEOUT", "unknown"),
+        ("NO_OUTPUT", "unknown"),
+        ("CANCELLED", "unknown"),
+    ],
+)
+def test_terminal_status_classifies_one_rollout(
+    workflow, monkeypatch, status, expected_origin
+):
+    audit = Mock()
+    monkeypatch.setattr("examples.swe.arena_agent.logger.warning", audit)
+    error = _terminal_failure(status, {"harness": {"result_status": "ERROR"}})
+    with capture_metrics() as metrics:
+        workflow._record_attempt_metrics({}, error)
+    for origin in ("arena", "model", "unknown"):
+        assert metrics[f"rollout/error_rate/{origin}"] == [
+            float(origin == expected_origin)
+        ]
+    if status == "ERROR":
+        assert audit.call_args.args[-1] == "grader_reported_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["HARNESS_FAILED", "TIMEOUT", "NO_OUTPUT"])
+@pytest.mark.parametrize(
+    "reason", ["empty_completion", "tool_call_argument_bytes_exceeded"]
+)
+async def test_verified_model_receipt_classifies_ambiguous_terminal_status(
+    workflow, monkeypatch, status, reason
+):
+    error = (
+        _core_tool_budget_failure_error()
+        if reason == "tool_call_argument_bytes_exceeded"
+        else _core_model_failure_error(
+            "LLM_RESPONSE_FAILED",
+            "empty_completion",
+            "model stopped without visible output or tool calls",
+        )
+    )
+    result = replace(error.result, status=status)
+    terminal = ArenaTaskFailedError(error.task_id, status, result=result)
+    monkeypatch.setattr(
+        workflow.client,
+        "get_harness_result_async",
+        AsyncMock(return_value=error.harness_result),
+    )
+    monkeypatch.setattr(
+        workflow.client, "launch_one_task_result", AsyncMock(side_effect=terminal)
+    )
+    with capture_metrics() as metrics:
+        with pytest.raises(ArenaTaskFailedError):
+            await run_agent(workflow)
+    assert metrics[f"rollout/error_rate/model_reason/{reason}"] == [1.0]
+    assert metrics["rollout/error_rate/model_reason/other_model_error"] == [0.0]
+    assert metrics["rollout/error_rate/model"] == [1.0]
+    assert (
+        metrics["rollout/error_rate/arena"]
+        == metrics["rollout/error_rate/unknown"]
+        == [0.0]
+    )
+
+
+def _assert_batch_error_rates(stats, scope, reasons):
+    """Check the public rates against one expected failure reason per attempt."""
+    prefix = f"{scope}/error_rate/"
+    rates = {
+        key.removeprefix(prefix): value
+        for key, value in stats.items()
+        if key.startswith(prefix) and not key.endswith("__count")
+    }
+    assert stats[f"{scope}/task_attempt_count"] == len(reasons)
+    assert not any(key.endswith("_count") for key in rates)
+    counts = Counter(reason for reason in reasons if reason is not None)
+    observed = {key: rate for key, rate in rates.items() if "_reason/" in key and rate}
+    assert observed == pytest.approx(
+        {reason: count / len(reasons) for reason, count in counts.items()}
+    )
+    for origin in ("arena", "model", "unknown"):
+        total = sum(
+            rate for key, rate in rates.items() if key.startswith(f"{origin}_reason/")
+        )
+        assert rates[origin] == pytest.approx(total)
+    assert sum(
+        rates[origin] for origin in ("arena", "model", "unknown")
+    ) == pytest.approx(stats[f"{scope}/task_attempt/error"])
+
+
+@pytest.mark.asyncio
+async def test_reason_rates_partition_consumed_origins(workflow, monkeypatch):
+    audit = Mock()
+    monkeypatch.setattr("examples.swe.arena_agent.logger.warning", audit)
+    refused_exec = {"arca": {"operation": "exec", "success": False, "http_status": 403}}
+    attempts = [
+        ("a", None, None),
+        ("a", asyncio.CancelledError(), None),
+        ("a", ArenaTaskFailedError("t", "SETUP_FAILED"), "arena_reason/setup_failed"),
+        ("b", _api_failure("spanner_apigwmoe_502"), "arena_reason/openapi_error_502"),
+        ("a", _api_failure("arena_openapi_http_502"), "arena_reason/openapi_error_502"),
+        (
+            "b",
+            _api_failure("arena_openapi_ReadTimeout"),
+            "arena_reason/openapi_network_error",
+        ),
+        (
+            "a",
+            _terminal_failure("TIMEOUT", {"arca": {"http_status": 503}}),
+            "arena_reason/sandbox_error",
+        ),
+        (
+            "b",
+            _terminal_failure("HARNESS_FAILED", refused_exec),
+            "arena_reason/sandbox_error",
+        ),
+        ("b", ArenaAPIError("invalid response payload"), "unknown_reason/client_error"),
+        (
+            "a",
+            _terminal_failure(
+                "HARNESS_FAILED", {"outcome_code": "AGENT_MAX_TURNS_EXCEEDED"}
+            ),
+            "model_reason/max_turns_exceeded",
+        ),
+        (
+            "b",
+            _terminal_failure(
+                "HARNESS_FAILED", {"outcome_code": "AUTONOMOUS_INCOMPLETE_NO_SHIP"}
+            ),
+            "model_reason/other_model_error",
+        ),
+        ("a", ArenaTaskFailedError("t", "NO_OUTPUT"), "unknown_reason/no_output"),
+        (
+            "a",
+            _core_tool_budget_failure_error(),
+            "model_reason/tool_call_argument_bytes_exceeded",
+        ),
+        ("b", ArenaTaskFailedError("t", "TIMEOUT"), "unknown_reason/timeout"),
+        ("b", ValueError("unexpected-private-detail"), "unknown_reason/other"),
+    ]
+    consumed = ConsumedMetrics()
+    for stream, error, selected in attempts:
+        monkeypatch.setattr(
+            workflow, "_run_task", AsyncMock(side_effect=error, return_value=0.0)
+        )
+        data = {"arena_stream_name": stream}
+        with capture_metrics() as metrics:
+            if error is None:
+                assert await workflow.run(data) == 0.0
+            else:
+                with pytest.raises(type(error)):
+                    await workflow.run(data)
+        assert metrics["rollout/task_attempt/cancelled"] == [
+            float(isinstance(error, asyncio.CancelledError))
+        ]
+        assert metrics["rollout/task_attempt/success"] == [float(error is None)]
+        consumed.consume(SimpleNamespace(metrics=metrics, trajectory=None))
+
+    logged_reasons = {call.args[-1] for call in audit.call_args_list}
+    assert {
+        "spanner_apigwmoe_502",
+        "arena_openapi_http_502",
+        "arena_openapi_ReadTimeout",
+        "arca_http_503",
+    } <= logged_reasons
+    stats = consumed.export()
+    for scope, observations in (
+        ("rollout", attempts),
+        ("rollout/stream/a", [a for a in attempts if a[0] == "a"]),
+        ("rollout/stream/b", [a for a in attempts if a[0] == "b"]),
+    ):
+        _assert_batch_error_rates(
+            stats, scope, [selected for _, _, selected in observations]
+        )
+    assert not any("private-detail" in key for key in stats)
+    assert consumed.export() == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "responses,action,retries,expected_reason",
+    [
+        ([503], "launch_deadline", 3, "arena_reason/openapi_error_503"),
+        ([403], "error", 0, "arena_reason/openapi_error_403"),
+        ([401], "error", 0, "arena_reason/openapi_error_401"),
+        ([418], "error", 0, "arena_reason/openapi_error_other"),
+        ([429], "deadline", 0, "arena_reason/openapi_error_429"),
+        (["read_timeout"], "deadline", 3, "arena_reason/openapi_network_error"),
+        (["connect_error"], "deadline", 0, "arena_reason/openapi_network_error"),
+        (["read_timeout", "DONE"], "finish", 0, None),
+        (
+            ["read_timeout", "RUNNING"],
+            "deadline",
+            0,
+            "unknown_reason/local_wait_timeout",
+        ),
+        (["local_protocol"], "error", 0, "unknown_reason/client_error"),
+        (["spanner_403"], "deadline", 3, "arena_reason/openapi_error_403"),
+        (["spanner_403", "DONE"], "finish", 0, None),
+        ([503, 503], "deadline", 0, "arena_reason/openapi_error_503"),
+        ([503], "deadline", 3, "arena_reason/openapi_error_503"),
+        ([503, "RUNNING"], "deadline", 0, "unknown_reason/local_wait_timeout"),
+        ([503, "read_error"], "deadline", 0, "arena_reason/openapi_network_error"),
+        ([503, "DONE"], "finish", 0, None),
+        ([503], "cancel", 0, None),
+    ],
+)
+async def test_poll_outage_attribution_at_attempt_boundary(
+    workflow, monkeypatch, responses, action, retries, expected_reason
+):
+    # Expire the workflow's actual deadline on the selected transport observation,
+    # including when the client is about to sleep inside its request retry loop.
+    deadline = asyncio.timeout(None)
+    real_timeout = asyncio.timeout
+    monkeypatch.setattr(
+        "examples.swe.arena_agent.asyncio.timeout",
+        lambda delay: deadline if delay == workflow.timeout else real_timeout(delay),
+    )
+    workflow.client.request_retries = retries
+    workflow.client.poll_interval = 0
+    reads = 0
+    launches = 0
+    cancels = 0
+
+    def handle(request):
+        nonlocal reads, launches, cancels
+        if request.url.path.endswith("/cancel"):
+            cancels += 1
+            return httpx.Response(200, json={})
+        if request.method == "POST":
+            launches += 1
+            if action == "launch_deadline":
+                deadline.reschedule(asyncio.get_running_loop().time())
+                return httpx.Response(503)
+            return httpx.Response(
+                202, json={"job_id": "j", "task_id": "t", "status": "RUNNING"}
+            )
+        assert request.url.path.endswith("/tasks/t/result")
+        item = responses[reads]
+        reads += 1
+        if reads == len(responses):
+            if action == "deadline":
+                deadline.reschedule(asyncio.get_running_loop().time())
+            elif action == "cancel":
+                asyncio.get_running_loop().call_soon(asyncio.current_task().cancel)
+        if item == "spanner_403":
+            return httpx.Response(403, text="spanner-http-ant-group-watch-all")
+        if item == "read_timeout":
+            raise httpx.ReadTimeout("read timeout", request=request)
+        if item == "connect_error":
+            raise httpx.ConnectError("connection refused", request=request)
+        if item == "local_protocol":
+            raise httpx.LocalProtocolError("invalid request", request=request)
+        if item == "read_error":
+            raise httpx.ReadError("connection lost", request=request)
+        if isinstance(item, int):
+            return httpx.Response(item)
+        return httpx.Response(
+            200,
+            json={
+                "task_id": "t",
+                "status": item,
+                "score": 0.5 if item == "DONE" else None,
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        with capture_metrics() as metrics:
+            attempt = workflow.run(
+                {"stream_id": "stream", "data_id": "d"},
+                base_url="http://proxy",
+                api_key="test",
+                arena_http_client=client,
+            )
+            if action == "finish":
+                assert await attempt == 0.5
+            elif action == "error":
+                with pytest.raises(ArenaAPIError):
+                    await attempt
+            else:
+                with pytest.raises(
+                    asyncio.CancelledError if action == "cancel" else TimeoutError
+                ):
+                    await attempt
+    if action == "launch_deadline":
+        assert (launches, reads, cancels) == (1, 0, 0)
+    else:
+        assert (launches, reads, cancels) == (
+            1,
+            len(responses),
+            int(action != "finish"),
+        )
+    consumed = ConsumedMetrics()
+    consumed.consume(SimpleNamespace(metrics=metrics, trajectory=None))
+    stats = consumed.export()
+    assert stats["rollout/task_attempt_count"] == 1
+    assert stats["rollout/task_attempt/cancelled"] == float(action == "cancel")
+    assert stats["rollout/task_attempt/error"] == float(
+        action in {"error", "deadline", "launch_deadline"}
+    )
+    for scope in ("rollout", "rollout/stream/stream"):
+        _assert_batch_error_rates(stats, scope, [expected_reason])
+
+
+def test_http_code_rates_merge_workers_with_different_batch_sizes(workflow):
+    batches = [[None, 503, 503, 403, None, 502], [418, 599, 503]]
+    workers = []
+    for batch in batches:
+        buffer = ConsumedMetrics()
+        with capture_metrics() as metrics:
+            for code in batch:
+                error = None
+                if code is not None:
+                    error = _api_failure(f"arena_openapi_http_{code}")
+                workflow._record_attempt_metrics({"stream_id": "s"}, error)
+        buffer.consume(SimpleNamespace(trajectory=None, metrics=metrics))
+        workers.append(buffer.export())
+
+    merged = _merge_worker_stats(workers)
+    for scope in ("rollout", "rollout/stream/s"):
+        prefix = f"{scope}/error_rate/arena_reason/"
+        rates = {
+            key.removeprefix(prefix): value
+            for key, value in merged.items()
+            if key.startswith(prefix)
+        }
+        assert {key: rate for key, rate in rates.items() if rate} == pytest.approx(
+            {
+                "openapi_error_503": 3 / 9,
+                "openapi_error_502": 1 / 9,
+                "openapi_error_403": 1 / 9,
+                "openapi_error_other": 2 / 9,
+            }
+        )
+        assert rates["openapi_error_429"] == 0
+        assert "openapi_error_418" not in rates and "openapi_error_599" not in rates
+        assert sum(rates.values()) == pytest.approx(merged[f"{scope}/error_rate/arena"])
+
+
+@pytest.mark.parametrize(
+    "origin,detail,reason",
+    [
+        ("arena", "spanner_apigwmoe_502", "openapi_error_502"),
+        ("arena", "spanner_arenaonlinegateway_504", "openapi_error_504"),
+        ("arena", "arena_openapi_http_302", "openapi_error_302"),
+        ("arena", "arena_openapi_http_599", "openapi_error_other"),
+        ("arena", "arena_openapi_ConnectError", "openapi_network_error"),
+        ("arena", "arena_openapi_ReadTimeout", "openapi_network_error"),
+        ("arena", "arca_http_503", "sandbox_error"),
+        ("arena", "arca_exec_eof", "sandbox_error"),
+        ("model", "LLM_CONTEXT_WINDOW_EXCEEDED", "context_window_exceeded"),
+        ("model", "LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED", "output_token_limit"),
+        ("model", "INVALID_TOOL_JSON", "invalid_tool_json"),
+        ("model", "LLM_RESPONSE_FAILED", "other_model_error"),
+        ("unknown", "arena_openapi_LocalProtocolError", "client_error"),
+        ("unknown", "arena_openapi_PoolTimeout", "client_error"),
+        ("unknown", "ArenaAPIError", "client_error"),
+        ("unknown", "RuntimeError", "other"),
+    ],
+)
+def test_public_reason_keeps_transport_and_model_labels_bounded(origin, detail, reason):
+    assert _error_reason_bucket(origin, detail) == reason

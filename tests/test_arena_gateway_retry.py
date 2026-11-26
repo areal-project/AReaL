@@ -62,8 +62,10 @@ def test_result_redirect_retries_same_task_without_following_or_relaunching(
         assert requests[1] == requests[2]
         assert sleeps == [1]
     else:
-        with pytest.raises(ArenaAPIError, match="HTTP 302"):
+        with pytest.raises(ArenaAPIError, match="HTTP 302") as caught:
             asyncio.run(run())
+        assert caught.value.arena_failure_reason == "arena_openapi_http_302"
+        assert caught.value.task_id == "task-1"
         assert requests == [
             ("POST", "/openapi/v1/streams/stream-1/launch_one_task"),
             ("GET", "/openapi/v1/tasks/task-1/result"),
@@ -73,7 +75,8 @@ def test_result_redirect_retries_same_task_without_following_or_relaunching(
     assert sum(path.endswith("/launch_one_task") for _, path in requests) == 1
 
 
-def test_gateway_redirect_exhausts_retry_budget(monkeypatch):
+@pytest.mark.parametrize("marker", ["apigwmoe_502", "arenaonlinegateway_504"])
+def test_gateway_redirect_exhausts_retry_budget(monkeypatch, marker):
     requests = []
     monkeypatch.setattr("examples.swe.arena_client.time.sleep", lambda _: None)
 
@@ -81,17 +84,16 @@ def test_gateway_redirect_exhausts_retry_budget(monkeypatch):
         requests.append(request.url)
         return httpx.Response(
             302,
-            headers={
-                "location": "https://gateway.example/wait?fromspanner=apigwmoe_502"
-            },
+            headers={"location": f"https://gateway.example/wait?fromspanner={marker}"},
         )
 
     api = ArenaOpenAPIClient(
         base_url="https://arena.example", api_token="test-token", request_retries=2
     )
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(ArenaAPIError, match="HTTP 302"):
+        with pytest.raises(ArenaAPIError, match="HTTP 302") as caught:
             api.list_streams(client=client)
+    assert caught.value.arena_failure_reason == f"spanner_{marker}"
     assert len(requests) == 3
     assert len(set(requests)) == 1
 

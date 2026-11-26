@@ -2106,6 +2106,13 @@ def test_agent_timeout_preserves_failure_scope(monkeypatch, failure, task_id):
             workflow.should_reject_failed_sample(caught.value, "system_failure_reject")
             == is_local_task_timeout
         )
+    if failure != "cancel":
+        message, args = warnings.pop()
+        assert message.startswith("Arena rollout failure:")
+        assert args[-2:] == (
+            "unknown",
+            "local_wait_timeout" if is_local_task_timeout else "TimeoutError",
+        )
     if failure == "client":
         assert caught.value is inner_error
         assert warnings == []

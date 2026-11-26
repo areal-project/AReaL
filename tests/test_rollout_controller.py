@@ -1550,7 +1550,17 @@ class TestRolloutControllerExportStats:
         )
         controller._collective_rpc = Mock(return_value=[{}])
         controller.consumed_metrics.consume(
-            _RolloutResult(0, {}, {"rollout/reward": [1.0, 1.0]})
+            _RolloutResult(
+                0,
+                {},
+                {
+                    "rollout/reward": [1.0, 1.0],
+                    "rollout/error_rate/arena": [0.0, 0.0],
+                    "rollout/error_rate/arena_reason/setup_failed": [0.0, 0.0],
+                    "rollout/error_rate/model": [0.0, 1.0],
+                    "rollout/error_rate/unknown": [0.0, 0.0],
+                },
+            )
         )
         controller.consumed_metrics.consume(
             _RolloutResult(
@@ -1558,6 +1568,10 @@ class TestRolloutControllerExportStats:
                 None,
                 {
                     "rollout/reward": [0.0],
+                    "rollout/error_rate/arena": [1.0],
+                    "rollout/error_rate/arena_reason/setup_failed": [1.0],
+                    "rollout/error_rate/model": [0.0],
+                    "rollout/error_rate/unknown": [0.0],
                     "rollout/task_attempt/success": [0.0, 0.0, 0.0],
                     "rollout/harness_success": [0.0, 0.0],
                     "rollout/harness_error": [1.0, 0.0],
@@ -1571,6 +1585,13 @@ class TestRolloutControllerExportStats:
         )
         stats = controller.export_stats()
         assert stats["rollout/reward"] == pytest.approx(2 / 3)
+        assert "rollout/error_rate/arena_reason/setup_failed_count" not in stats
+        assert stats["rollout/error_rate/arena_reason/setup_failed"] == pytest.approx(
+            1 / 3
+        )
+        assert "rollout/error_rate/rollout_count" not in stats
+        for origin, count in (("arena", 1), ("model", 1), ("unknown", 0)):
+            assert stats[f"rollout/error_rate/{origin}"] == pytest.approx(count / 3)
         assert stats["rollout/reward_sample_count"] == 3
         assert stats["rollout/task_attempt_count"] == 3
         assert stats["rollout/task_result_count"] == 2

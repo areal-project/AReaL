@@ -8,6 +8,7 @@ import os
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from numbers import Real
 from typing import Any, Literal
@@ -24,6 +25,16 @@ LLMProtocol = Literal["anthropic", "responses", "chat_completions"]
 
 class ArenaAPIError(RuntimeError):
     """Raised when the Arena OpenAPI returns an invalid or failed response."""
+
+    task_id: str | None = None
+    arena_failure_reason: str | None = None
+
+
+@dataclass
+class ArenaTaskRequestState:
+    """Latest OpenAPI failure during launch or result polling for one attempt."""
+
+    gateway_failure_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -85,14 +96,18 @@ def _is_retryable_status(status_code: int) -> bool:
     return status_code == 429 or status_code >= 500
 
 
+def _spanner_marker(response: httpx.Response) -> list[str] | None:
+    location = response.headers.get("location", "")
+    return parse_qs(urlsplit(location).query).get("fromspanner")
+
+
 def _is_retryable_response(
     response: httpx.Response, method: str, *, retry_gateway_timeout: bool = False
 ) -> bool:
     if _is_retryable_status(response.status_code):
         return True
     if response.status_code == 302:
-        location = response.headers.get("location", "")
-        marker = parse_qs(urlsplit(location).query).get("fromspanner")
+        marker = _spanner_marker(response)
         # A gateway timeout may occur after a task launch was accepted.
         return marker == ["apigwmoe_502"] or (
             marker == ["arenaonlinegateway_504"]
@@ -127,14 +142,50 @@ def resolve_arena_credentials(
     return resolved_base_url.rstrip("/"), resolved_api_token
 
 
+def _gateway_failure_reason(response: httpx.Response) -> str | None:
+    if response.status_code == 302:
+        marker = _spanner_marker(response)
+        if marker in (["apigwmoe_502"], ["arenaonlinegateway_504"]):
+            return f"spanner_{marker[0]}"
+    if not response.is_success:
+        return f"arena_openapi_http_{response.status_code}"
+    return None
+
+
+def _network_failure_reason(exc: httpx.RequestError) -> str | None:
+    if isinstance(
+        exc,
+        (
+            httpx.NetworkError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.RemoteProtocolError,
+            httpx.ProxyError,
+        ),
+    ):
+        return f"arena_openapi_{type(exc).__name__}"
+    return None
+
+
+def _request_failure(exc: httpx.RequestError, attempts: int) -> ArenaAPIError:
+    error = ArenaAPIError(
+        f"Arena OpenAPI request failed after {attempts} attempts: {type(exc).__name__}"
+    )
+    error.arena_failure_reason = _network_failure_reason(exc)
+    return error
+
+
 def _response_json(response: httpx.Response) -> Any:
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         body = response.text[:500]
-        raise ArenaAPIError(
+        error = ArenaAPIError(
             f"Arena OpenAPI returned HTTP {response.status_code}: {body}"
-        ) from exc
+        )
+        error.arena_failure_reason = _gateway_failure_reason(response)
+        raise error from exc
     try:
         return response.json()
     except ValueError as exc:
@@ -954,10 +1005,7 @@ class ArenaOpenAPIClient:
                     response = request_client.request(method, url, **kwargs)
                 except httpx.RequestError as exc:
                     if attempt == self.request_retries:
-                        raise ArenaAPIError(
-                            "Arena OpenAPI request failed after "
-                            f"{attempt + 1} attempts: {type(exc).__name__}"
-                        ) from exc
+                        raise _request_failure(exc, attempt + 1) from exc
                     time.sleep(min(2**attempt, 10))
                     continue
                 if not _is_retryable_response(response, method):
@@ -978,6 +1026,7 @@ class ArenaOpenAPIClient:
         url: str,
         _retry_count: int | None = None,
         _retry_gateway_timeout: bool = False,
+        _task_request_state: ArenaTaskRequestState | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
         retries = self.request_retries if _retry_count is None else _retry_count
@@ -985,20 +1034,24 @@ class ArenaOpenAPIClient:
             try:
                 response = await client.request(method, url, **kwargs)
             except httpx.RequestError as exc:
+                error = _request_failure(exc, attempt + 1)
+                if _task_request_state is not None:
+                    _task_request_state.gateway_failure_reason = (
+                        error.arena_failure_reason
+                    )
                 if attempt == retries:
-                    raise ArenaAPIError(
-                        f"Arena OpenAPI request failed after {attempt + 1} attempts: "
-                        f"{type(exc).__name__}"
-                    ) from exc
-                await asyncio.sleep(min(2**attempt, 10))
-                continue
-            if not _is_retryable_response(
-                response, method, retry_gateway_timeout=_retry_gateway_timeout
-            ):
-                return response
-            if attempt == retries:
-                return response
-            await response.aclose()
+                    raise error from exc
+            else:
+                if _task_request_state is not None:
+                    # The rollout deadline may expire during the backoff below.
+                    _task_request_state.gateway_failure_reason = (
+                        _gateway_failure_reason(response)
+                    )
+                if attempt == retries or not _is_retryable_response(
+                    response, method, retry_gateway_timeout=_retry_gateway_timeout
+                ):
+                    return response
+                await response.aclose()
             await asyncio.sleep(min(2**attempt, 10))
         raise AssertionError("unreachable")
 
@@ -1061,6 +1114,7 @@ class ArenaOpenAPIClient:
         metadata: Mapping[str, str] | None = None,
         client: httpx.AsyncClient | None = None,
         on_launch_success: Callable[[str | None], None] | None = None,
+        task_request_state: ArenaTaskRequestState | None = None,
     ) -> ArenaTaskResult:
         """Launch a task with optional experiment and string-valued metadata."""
         encoded_stream_id = quote(stream_id, safe="")
@@ -1101,19 +1155,18 @@ class ArenaOpenAPIClient:
             request["experiment"] = experiment
         if launch_metadata:
             request["metadata"] = launch_metadata
-        if client is not None:
+        session = (
+            nullcontext(client)
+            if client is not None
+            else httpx.AsyncClient(timeout=self.timeout)
+        )
+        async with session as launch_client:
             return await self._launch_and_wait(
-                client,
+                launch_client,
                 url,
                 request,
                 on_launch_success=on_launch_success,
-            )
-        async with httpx.AsyncClient(timeout=self.timeout) as owned_client:
-            return await self._launch_and_wait(
-                owned_client,
-                url,
-                request,
-                on_launch_success=on_launch_success,
+                task_request_state=task_request_state,
             )
 
     async def _launch_and_wait(
@@ -1123,6 +1176,7 @@ class ArenaOpenAPIClient:
         request: dict[str, Any],
         *,
         on_launch_success: Callable[[str | None], None] | None = None,
+        task_request_state: ArenaTaskRequestState | None = None,
     ) -> ArenaTaskResult:
         response = await self._async_request(
             client,
@@ -1130,6 +1184,7 @@ class ArenaOpenAPIClient:
             url,
             json=request,
             headers=self._headers,
+            _task_request_state=task_request_state,
         )
         payload = _response_json(response)
         result = _parse_task_result(payload, fallback_task_id="launch_one_task")
@@ -1148,12 +1203,16 @@ class ArenaOpenAPIClient:
                 try:
                     if on_launch_success is not None:
                         on_launch_success(task_id)
-                    return await self._poll_task_result(client, task_id)
+                    return await self._poll_task_result(
+                        client, task_id, task_request_state
+                    )
                 except ArenaTaskFailedError:
                     # The server has already finished this task. Preserve its
                     # failure receipt rather than cancelling a terminal job.
                     raise
-                except (Exception, asyncio.CancelledError):
+                except (Exception, asyncio.CancelledError) as exc:
+                    if isinstance(exc, ArenaAPIError):
+                        exc.task_id = task_id
                     # Worker destruction cancels pending workflows before Ray
                     # stops the RPC processes. Finish remote cleanup while the
                     # workflow's HTTP client and proxy route are still alive.
@@ -1249,6 +1308,7 @@ class ArenaOpenAPIClient:
         self,
         client: httpx.AsyncClient,
         task_id: str,
+        task_request_state: ArenaTaskRequestState | None = None,
     ) -> ArenaTaskResult:
         encoded_task_id = quote(task_id, safe="")
         url = f"{self.base_url}/openapi/v1/tasks/{encoded_task_id}/result"
@@ -1260,6 +1320,7 @@ class ArenaOpenAPIClient:
                     "GET",
                     url,
                     headers=self._headers,
+                    _task_request_state=task_request_state,
                 )
             except ArenaAPIError as exc:
                 cause = exc.__cause__
