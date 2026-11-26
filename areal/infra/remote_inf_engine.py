@@ -53,6 +53,7 @@ from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names, stats_tracker
 from areal.utils.data import RolloutGroup, concat_padded_tensors, get_batch_size
 from areal.utils.dynamic_import import bind_filter_kwargs, import_from_string
+from areal.utils.errors import ModelExecutionTimeoutError
 from areal.utils.network import (
     find_free_ports,
     format_hostport,
@@ -1189,6 +1190,9 @@ class RemoteInfEngine(InferenceEngine):
 
         # Deal with rollout interruption
         stop_reason = None
+        # Preserve uncertainty across every pause/resubmit segment of this
+        # logical model request, not just one HTTP retry loop.
+        generation_errors: list[Exception] = []
         ori_max_new_tokens = gconfig.max_new_tokens
         while (
             stop_reason not in ["stop", "tool_calls", "length"]
@@ -1234,6 +1238,19 @@ class RemoteInfEngine(InferenceEngine):
                     ) as response:
                         if response.status >= 400:
                             error_body = await _read_http_error_body(response)
+                            classify_error = getattr(
+                                self.backend, "generation_error", None
+                            )
+                            if classify_error is not None:
+                                terminal_error = classify_error(
+                                    response.status, error_body
+                                )
+                                if isinstance(
+                                    terminal_error, ModelExecutionTimeoutError
+                                ):
+                                    # The backend confirmed termination. Release the
+                                    # route lease before propagating the model error.
+                                    return terminal_error, "aborted"
                             try:
                                 response.raise_for_status()
                             except aiohttp.ClientResponseError as exc:
@@ -1252,7 +1269,10 @@ class RemoteInfEngine(InferenceEngine):
                                 raise
                         response.raise_for_status()
                         result = await response.json()
-                    parsed = self.backend.parse_generation_response(result)
+                    try:
+                        parsed = self.backend.parse_generation_response(result)
+                    except ModelExecutionTimeoutError as exc:
+                        return exc, "aborted"
                     if parsed.stop_reason not in (
                         "stop",
                         "tool_calls",
@@ -1272,21 +1292,34 @@ class RemoteInfEngine(InferenceEngine):
                     current_backend_session.get(),
                     generate,
                 )
+                if isinstance(gen_result, ModelExecutionTimeoutError):
+                    raise gen_result
             else:
-                result = await arequest_with_retry(
-                    session=session,
-                    addr=server_addr,
-                    endpoint=http_req.endpoint,
-                    payload=http_req.payload,
-                    method=http_req.method,
-                    max_retries=self.config.request_retries,
-                    timeout=self.config.request_timeout,
-                )
-                if not isinstance(result, dict):
-                    raise ValueError(
-                        f"Expected JSON dict response, got {type(result).__name__}"
+                try:
+                    result = await arequest_with_retry(
+                        session=session,
+                        addr=server_addr,
+                        endpoint=http_req.endpoint,
+                        payload=http_req.payload,
+                        method=http_req.method,
+                        max_retries=self.config.request_retries,
+                        timeout=self.config.request_timeout,
+                        generation_error=getattr(
+                            self.backend, "generation_error", None
+                        ),
+                        on_retry_error=generation_errors.append,
                     )
-                gen_result = self.backend.parse_generation_response(result)
+                    if not isinstance(result, dict):
+                        raise ValueError(
+                            f"Expected JSON dict response, got {type(result).__name__}"
+                        )
+                    gen_result = self.backend.parse_generation_response(result)
+                except ModelExecutionTimeoutError as exc:
+                    if generation_errors:
+                        raise RuntimeError(
+                            "Model timeout followed an uncertain generation HTTP attempt"
+                        ) from exc
+                    raise
             stop_reason = gen_result.stop_reason
 
             if (
