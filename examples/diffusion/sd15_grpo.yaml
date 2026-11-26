@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+# Phase 1 PoC config for SD1.5 + LoRA + GRPO with an aesthetic reward.
+# This is a plain example config consumed by examples/diffusion/sd15_grpo.py;
+# it is NOT wired into areal/api/cli_args.py (Phase 1 keeps the API surface
+# untouched). Multi-GPU / FSDP2 / async rollout are out of scope for Phase 1.
+
+model:
+  # Local dir written by prepare_assets.sh (default). Can also be a
+  # HuggingFace/ModelScope hub id.
+  model_path: ./assets/diffusion/stable-diffusion-v1-5
+  # float32 is the recommended/stable setting for REINFORCE fine-tuning: fp16 has
+  # a narrow dynamic range and the UNet forward overflows to NaN after the first
+  # LoRA update (rewards then collapse). On a 48GB GPU fp32 peaks at ~12GB.
+  dtype: float32
+  device: cuda
+  lora_rank: 8
+
+reward:
+  # Path to the LAION aesthetic predictor MLP head, e.g.
+  # sac+logos+ava1-l14-linearMSE.pth. Required; no silent zero-reward fallback.
+  aesthetic_weights: ./assets/diffusion/sac+logos+ava1-l14-linearMSE.pth
+  clip_model: ./assets/diffusion/clip-vit-large-patch14
+
+sampling:
+  group_size: 8
+  num_inference_steps: 20
+  guidance_scale: 7.5
+  # eta MUST be > 0 so the DDIM transition kernel is stochastic and yields
+  # per-step log-probs usable for policy gradients.
+  eta: 1.0
+  height: 512
+  width: 512
+
+train:
+  lr: 1.0e-4
+  # PPO clip range for the GRPO ratio surrogate. In Phase 1 the single
+  # on-policy step keeps the ratio ~1, so clipping is rarely active; it matters
+  # for the off-policy reuse planned in Phase 2.
+  clip_eps: 0.2
+  num_iterations: 100
+  save_path: ./sd15_grpo_lora
+
+data:
+  # Text file with one training prompt per line (# comments allowed). Download
+  # nothing for this -- prompts ship in-repo. Run examples/diffusion/
+  # prepare_assets.sh to fetch the SD1.5 / CLIP / aesthetic-predictor weights.
+  prompt_file: examples/diffusion/prompts/aesthetic_prompts.txt
