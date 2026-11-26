@@ -49,3 +49,27 @@ def test_mm_limits_dictconfig_validation_rejects_negative_count():
     config.limit_mm_data_per_request = {"image": -1}
     with pytest.raises(ValueError, match="limit_mm_data_per_request"):
         SGLangConfig.build_args(config, tp_size=1, base_gpu_id=0)
+
+
+@pytest.mark.parametrize("as_dataclass", [False, True])
+@pytest.mark.parametrize(
+    "options",
+    [
+        None,
+        {},
+        {"image": {"min_pixels": 65536, "max_pixels": 1048576}, "video": {"fps": 2.0}},
+    ],
+)
+def test_mm_process_config_reaches_cli_as_json(options, as_dataclass):
+    config = OmegaConf.structured(SGLangConfig)
+    if options is not None:
+        config = OmegaConf.merge(config, {"mm_process_config": options})
+    if as_dataclass:
+        config = OmegaConf.to_object(config)
+
+    argv = SGLangConfig.build_cmd(config, tp_size=1, base_gpu_id=0)
+    flag = "--mm-process-config"
+    if options is None:
+        assert flag not in argv
+    else:
+        assert json.loads(argv[argv.index(flag) + 1]) == options
