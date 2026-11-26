@@ -25,12 +25,20 @@ from areal.v2.reconfiguration import (
     sglang_gpus_per_node,
 )
 
-from .evaluator import CapacityEvaluator, Catalog, load_profiles
+from .evaluator import (
+    ActorStages,
+    CapacityEvaluator,
+    Catalog,
+    IOBandwidth,
+    ReconfigurationModel,
+    RolloutStages,
+    load_profiles,
+)
 from .evaluator.contracts import ActorConfig
 from .evaluator.workload import ExecutionConfig, ServingSLO
 from .observation import LiveObservation
 from .optimizer import Layout, Optimizer, RoleLayout
-from .trigger import StableWorkloadTrigger
+from .trigger import CapacityTrigger
 
 logger = logging.getLogger("ElasticController")
 
@@ -169,7 +177,42 @@ def _placement(
     return place
 
 
-def _policy(trainer, binding, parameters, models):
+def _reconfiguration_model(
+    parameters, models, place, warm_actor, warm_rollout
+) -> ReconfigurationModel | None:
+    stages = parameters.get("cutover_parameters")
+    if not stages:
+        return None
+    if any(stages[k] != parameters["profiles"][k] for k in ("hardware", "model")):
+        raise ValueError(
+            "Cutover parameters must match the hardware and model profiles"
+        )
+    shape = models.actor_model.model
+    weight = shape.total_parameters * 2 / 1e9
+    actor = ActorStages(
+        weight,
+        6 * weight,
+        IOBandwidth(**stages["write_GBps"]),
+        IOBandwidth(**stages["read_GBps"]),
+        warm_nodes=frozenset(warm_actor),
+        expert_fraction=shape.layers
+        * shape.expert_parameters_per_layer
+        / shape.total_parameters
+        if shape.mlp_type == "moe"
+        else 0.0,
+        **stages["actor"],
+    )
+    rollout = RolloutStages(warm_nodes=frozenset(warm_rollout), **stages["rollout"])
+    return ReconfigurationModel(
+        actor.predict,
+        rollout.predict,
+        place,
+        stages["pause_disconnect"],
+        stages["reconnect_resume"],
+    )
+
+
+def _policy(trainer, binding, warm_actor, warm_rollout, parameters, models):
     cfg = trainer.config
     actor_layout, rollout_layout, dp = binding
     template = ExecutionConfig(
@@ -191,6 +234,7 @@ def _policy(trainer, binding, parameters, models):
     )
     pool = tuple(trainer._reconfiguration_devices)
     place = _placement(pool, current, actor_layout, rollout_layout)
+    cut = _reconfiguration_model(parameters, models, place, warm_actor, warm_rollout)
 
     window = parameters["window"]
     slo = ServingSLO(
@@ -203,7 +247,13 @@ def _policy(trainer, binding, parameters, models):
         batch_size=cfg.train_dataset.batch_size,
         concurrency=cfg.rollout.max_concurrent_rollouts,
     )
-    search = Optimizer(evaluator, len(pool), place)
+    search = Optimizer(
+        evaluator,
+        len(pool),
+        place,
+        reconfiguration=cut,
+        horizon_seconds=cfg.elastic.forecast_seconds,
+    )
     return search, current, place
 
 
@@ -224,11 +274,15 @@ class ElasticController:
             bandwidth_GBps=self.parameters["publication_GBps"],
             actor_runtime=ActorConfig.from_areal(asdict(trainer.config.actor)),
         )
-        self.trigger = StableWorkloadTrigger()
+        self.trigger = CapacityTrigger()
         self.lock = Lock()
+        self._step_lock = Lock()
+        self._step_held = False
         self.stop = Event()
         self.wake = Event()
         self.binding = self._binding()
+        self.warm_actor = {device.node for device in self.binding[0].devices}
+        self.warm_rollout = {device.node for device in self.binding[1].devices}
         self.policy = self._bind(self.binding)
         self.version = trainer.actor.get_version()
         self.latest_batch: tuple[str, ...] = ()
@@ -255,7 +309,28 @@ class ElasticController:
         )
 
     def _bind(self, binding):
-        return _policy(self.trainer, binding, self.parameters, self.models)
+        self.warm_actor.update(device.node for device in binding[0].devices)
+        self.warm_rollout.update(device.node for device in binding[1].devices)
+        return _policy(
+            self.trainer,
+            binding,
+            self.warm_actor,
+            self.warm_rollout,
+            self.parameters,
+            self.models,
+        )
+
+    def begin_training_step(self):
+        """Block reconfiguration while Actor training / weight update is active."""
+        self._step_lock.acquire()
+        self._step_held = True
+
+    def end_training_step(self):
+        """Release the training-step lock so idle-period reconfiguration can run."""
+        if self._step_held:
+            self._step_held = False
+            self._step_lock.release()
+            self.wake.set()
 
     def on_actor_batch(self, batch):
         session_ids = tuple(traj.pop("_elastic_session_id", "") for traj in batch)
@@ -280,12 +355,25 @@ class ElasticController:
             self.wake.clear()
             with self.lock:
                 self._collect_search()
+            self._try_apply_async()
             if time.monotonic() >= next_poll:
                 next_poll = time.monotonic() + self.trigger.window_seconds
                 self._poll_trigger(worker)
             self.wake.wait(
                 min(self.settings.poll_seconds, max(0, next_poll - time.monotonic()))
             )
+
+    def _try_apply_async(self):
+        """Apply a ready decision immediately whenever PPOTrainer is idle (e.g. prepare_batch)."""
+        with self.lock:
+            if self.ready is None or self.switching:
+                return
+        if not self._step_lock.acquire(blocking=False):
+            return
+        try:
+            self._apply_ready()
+        finally:
+            self._step_lock.release()
 
     def _poll_trigger(self, worker):
         with self.lock:
@@ -300,22 +388,30 @@ class ElasticController:
         if view is None:
             return
         batch = self.reader.episode_ids(sessions)
+        optimizer, layout, _ = policy
+        signal = self.trigger.observe(
+            view,
+            layout,
+            optimizer.evaluator,
+            batch,
+            min_actor_gpus=optimizer.min_actor_gpus,
+            min_rollout_gpus=optimizer.min_rollout_gpus,
+        )
+        if signal is None:
+            return
         with self.lock:
             if self.switching or policy is not self.policy:
                 return
-            change = self.trigger.observe(view, batch)
-            if change is None:
-                return
-            optimizer, layout, _ = policy
-            future = worker.submit(optimizer.decide, layout, change)
-            self.running = (future, self.generation, policy, at, change)
+            future = worker.submit(optimizer.decide, layout, signal)
+            self.running = (future, self.generation, policy, at, signal)
             future.add_done_callback(lambda _: self.wake.set())
         logger.info(
-            "Elastic trigger at version %s: %s (%.3f arrivals/s, score=%s)",
+            "Elastic trigger at version %s: %s (%.3f arrivals/s, E_actor=%.2f, E_rollout=%.2f)",
             version,
-            ", ".join(change.reasons),
-            change.rate,
-            "initial" if change.score is None else f"{change.score:.1%}",
+            ", ".join(signal.reasons),
+            signal.rate,
+            signal.actor_pressure,
+            signal.rollout_pressure,
         )
 
     def _collect_search(self):
@@ -339,22 +435,27 @@ class ElasticController:
             self.ready = (source, decision, at, change)
 
     def at_boundary(self):
-        """Apply a ready decision synchronously at a PPO publication boundary."""
+        """Propagate background errors and apply any ready decision at step end."""
+        with self._step_lock:
+            self._apply_ready(raise_error=True)
+
+    def _apply_ready(self, *, raise_error: bool = False):
+        """Apply a ready decision while holding _step_lock (idle Actor/Rollout)."""
         binding = self._binding()
         with self.lock:
             self.version = self.trainer.actor.get_version()
-            if self.error is not None:
+            if raise_error and self.error is not None:
                 raise RuntimeError("Automatic elastic search failed") from self.error
             if binding != self.binding:
                 self.binding = binding
                 self.policy = self._bind(binding)
                 self.generation += 1
                 self.ready = None
-                self.trigger.bind(None)
+                self.trigger.reset()
             self._collect_search()
             if self.ready is None:
                 return
-            source, decision, started, change = self.ready
+            source, decision, started, _ = self.ready
             self.ready = None
             if (
                 source is not self.policy
@@ -367,7 +468,7 @@ class ElasticController:
             if decision.target is None:
                 return
             if decision.target == layout:
-                self.trigger.bind(change)
+                self.trigger.reset()
                 return
             self.switching = True
 
@@ -397,10 +498,10 @@ class ElasticController:
             self.policy = self._bind(binding)
             self.generation += 1
             self.ready = None
-            self.trigger.bind(change)
+            self.trigger.reset()
             self.switching = False
         logger.info(
-            "Automatic elastic published layout at version %s: %s",
+            "Automatic elastic applied layout at version %s: %s",
             self.version,
             binding,
         )
@@ -408,4 +509,5 @@ class ElasticController:
     def close(self):
         self.stop.set()
         self.wake.set()
+        self.end_training_step()
         self.thread.join()

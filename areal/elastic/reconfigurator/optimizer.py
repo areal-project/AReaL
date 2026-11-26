@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Choose a physical layout by independently estimating Actor and Rollout capacity."""
+"""Choose a physical layout by independently scaling Actor and Rollout capacity."""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ from functools import cache
 from itertools import product
 from typing import TYPE_CHECKING
 
-from .trigger import WorkloadChange
+from .trigger import ScaleSignal
 
 if TYPE_CHECKING:
-    from .evaluator import CapacityEvaluator
+    from .evaluator import CapacityEvaluator, ReconfigurationModel
     from .evaluator.workload import ExecutionConfig
 
 
@@ -173,7 +173,6 @@ def physical_space(base: SearchSpace, template: ExecutionConfig, attention_dp_si
     if 1 not in sizes or False not in enabled:
         rollouts = ()
     elif template.sglang_enable_dp_attention or template.sglang_dp_size != 1:
-        # Disable inherited Attention DP for new targets, including TP > 1.
         off = (("sglang_dp_size", 1), ("sglang_enable_dp_attention", False))
         rollouts = tuple(replace(role, options=off) for role in rollouts)
     return PhysicalSpace(base.gpu_capacity, template.sglang_dp_size, actors, rollouts)
@@ -216,9 +215,7 @@ def supported_space(grid, evaluator, attention_dp_sizes):
     for role in space.rollouts:
         config = replace(template, rollout_backend=role.backend, **dict(role.options))
         try:
-            rollout_config(
-                models.rollout_template, models.rollout_model, config
-            )  # model shape and weight/KV capacity
+            rollout_config(models.rollout_template, models.rollout_model, config)
         except ValueError:
             continue
         rollouts.append(role)
@@ -236,42 +233,47 @@ class Decision:
 
 
 class Optimizer:
-    """Scale both GPU counts once, then search only that allocation."""
+    """Scale triggered role(s) proportionally, then search only that GPU split."""
+
+    theta_up = 0.90
 
     def __init__(
         self,
         evaluator: CapacityEvaluator,
         gpu_capacity: int,
         place: Callable[[Layout], object],
+        *,
+        reconfiguration: ReconfigurationModel | None = None,
+        horizon_seconds: float = 600.0,
     ):
         self.evaluator = evaluator
         self.place = place
         self.gpu_capacity = gpu_capacity
+        self.reconfiguration = reconfiguration
+        self.horizon_seconds = horizon_seconds
         self.space = supported_space(
             SearchSpace.for_pool(gpu_capacity, evaluator.batch_size), evaluator, (1,)
         )
 
-    def _split(self, current, rate, actor_rate, rollout_rate):
-        requested_actor = (
-            current.actor.gpus * rate / actor_rate if actor_rate else self.gpu_capacity
-        )
-        requested_rollout = (
-            current.rollout.gpus * rate / rollout_rate
-            if rollout_rate
-            else self.gpu_capacity
-        )
-        scale = min(1.0, self.gpu_capacity / (requested_actor + requested_rollout))
-        # Round up when there are enough GPUs, and project across supported
-        # counts when the estimate oversubscribes the pool or a count is absent.
-        target_actor = requested_actor * scale
-        target_rollout = requested_rollout * scale
+    @property
+    def min_actor_gpus(self) -> int:
+        return min((r.gpus for r in self.space.actors), default=1)
+
+    @property
+    def min_rollout_gpus(self) -> int:
+        return min((r.gpus for r in self.space.rollouts), default=1)
+
+    def _project(
+        self,
+        target_actor: float,
+        target_rollout: float,
+        actor_counts: set[int],
+        rollout_counts: set[int],
+    ) -> tuple[int, int]:
         return min(
             (
                 (a, r)
-                for a, r in product(
-                    {role.gpus for role in (*self.space.actors, current.actor)},
-                    {role.gpus for role in (*self.space.rollouts, current.rollout)},
-                )
+                for a, r in product(actor_counts, rollout_counts)
                 if a + r <= self.gpu_capacity
             ),
             key=lambda pair: (
@@ -287,28 +289,96 @@ class Optimizer:
             ),
         )
 
-    def decide(self, current: Layout, change: WorkloadChange) -> Decision:
+    def _split(
+        self, current: Layout, signal: ScaleSignal
+    ) -> tuple[tuple[int, int], bool, bool]:
+        """Compute target (actor_gpus, rollout_gpus) and which roles stay locked."""
+        rate = signal.rate
+        actor_rate = signal.actor_capacity
+        rollout_rate = signal.rollout_capacity.rate
+        inv_target = 1.0 / self.theta_up
+
+        requested_actor = (
+            current.actor.gpus * (rate / actor_rate) * inv_target
+            if actor_rate
+            else float(self.gpu_capacity)
+        )
+        requested_rollout = (
+            current.rollout.gpus * (rate / rollout_rate) * inv_target
+            if rollout_rate
+            else float(self.gpu_capacity)
+        )
+
+        actor_counts = {role.gpus for role in (*self.space.actors, current.actor)}
+        rollout_counts = {role.gpus for role in (*self.space.rollouts, current.rollout)}
+
+        # Single-role scale when only one role triggered and free pool GPUs suffice.
+        if signal.actor_action != "hold" and signal.rollout_action == "hold":
+            if requested_actor + current.rollout.gpus <= self.gpu_capacity:
+                split = self._project(
+                    requested_actor,
+                    float(current.rollout.gpus),
+                    actor_counts,
+                    {current.rollout.gpus},
+                )
+                return split, False, True
+        elif signal.rollout_action != "hold" and signal.actor_action == "hold":
+            if current.actor.gpus + requested_rollout <= self.gpu_capacity:
+                split = self._project(
+                    float(current.actor.gpus),
+                    requested_rollout,
+                    {current.actor.gpus},
+                    rollout_counts,
+                )
+                return split, True, False
+
+        # Joint proportional split (both roles triggered or pool full -> borrow GPUs).
+        scale = min(1.0, self.gpu_capacity / (requested_actor + requested_rollout))
+        split = self._project(
+            requested_actor * scale,
+            requested_rollout * scale,
+            actor_counts,
+            rollout_counts,
+        )
+        return split, False, False
+
+    def decide(self, current: Layout, signal: ScaleSignal) -> Decision:
         from .evaluator.rollout import probe_capacity
 
-        rate, pattern = change.rate, change.pattern
+        rate, pattern = signal.rate, signal.pattern
         target = self.evaluator.slo.minimum_request_fraction
-        publication = self.evaluator.publication_duration()
+        publication = signal.publication
+        current_rollout = signal.rollout_capacity
+        scale_in_only = (
+            signal.actor_action != "scale_out" and signal.rollout_action != "scale_out"
+        )
+
+        split, lock_actor, lock_rollout = self._split(current, signal)
+        if scale_in_only and sum(split) >= current.gpus:
+            return Decision(
+                current,
+                current,
+                split,
+                0,
+                0,
+                "Scale-in does not reduce total GPUs; keeping current layout",
+            )
 
         @cache
-        def actor_capacity(role):
+        def actor_capacity(role: RoleLayout):
+            if role == current.actor:
+                return signal.actor_capacity
             return self.evaluator.actor_capacity(role, pattern, publication)
 
         @cache
-        def rollout_slo(role, offered_rate):
+        def rollout_slo(role: RoleLayout, offered_rate: float):
             return self.evaluator.rollout_slo(role, pattern, offered_rate)
 
-        def rollout_capacity(role):
+        def rollout_capacity(role: RoleLayout):
+            if role == current.rollout:
+                return current_rollout
             return probe_capacity(lambda load: rollout_slo(role, load), rate, target)
 
-        current_rollout = rollout_capacity(current.rollout)
-        split = self._split(
-            current, rate, actor_capacity(current.actor), current_rollout.rate
-        )
         inherited = self.space.inherited_attention_dp
 
         def roles(catalogue, active, gpus):
@@ -328,8 +398,16 @@ class Optimizer:
                 key=rank,
             )
 
-        actors = roles(self.space.actors, current.actor, split[0])
-        rollouts = roles(self.space.rollouts, current.rollout, split[1])
+        actors = (
+            [current.actor]
+            if lock_actor
+            else roles(self.space.actors, current.actor, split[0])
+        )
+        rollouts = (
+            [current.rollout]
+            if lock_rollout
+            else roles(self.space.rollouts, current.rollout, split[1])
+        )
 
         def layouts(actor_roles, rollout_roles):
             for actor, rollout in product(actor_roles, rollout_roles):
@@ -340,7 +418,7 @@ class Optimizer:
                     continue
                 yield layout
 
-        def result(layout, reason):
+        def result(layout: Layout | None, reason: str) -> Decision:
             return Decision(
                 current,
                 layout,
@@ -350,7 +428,6 @@ class Optimizer:
                 reason,
             )
 
-        # Generators keep the SLO checks lazy, even when a split has many roles.
         for actor in actors:
             capacity = actor_capacity(actor)
             if capacity is None or capacity < rate:
@@ -358,14 +435,32 @@ class Optimizer:
             for layout in layouts((actor,), rollouts):
                 score = rollout_slo(layout.rollout, rate)
                 if score >= target:
+                    if scale_in_only:
+                        if layout.gpus >= current.gpus:
+                            return result(
+                                current,
+                                "Scale-in does not reduce total GPUs; keeping current layout",
+                            )
+                        if self.reconfiguration is not None:
+                            cutover = self.reconfiguration.predict(
+                                current, layout, publication
+                            )
+                            saved = (current.gpus - layout.gpus) * self.horizon_seconds
+                            if saved <= cutover.gpu_seconds:
+                                return result(
+                                    current,
+                                    "Scale-in GPU savings do not pay back cutover cost; keeping current layout",
+                                )
                     return result(layout, "Capacity and offered-task SLO meet demand")
 
-        @cache
-        def rollout_lower(role):
-            probe = (
-                current_rollout if role == current.rollout else rollout_capacity(role)
+        if scale_in_only:
+            return result(
+                current, "Scale-in target missed demand; keeping current layout"
             )
-            return probe.lower or 0.0
+
+        @cache
+        def rollout_lower(role: RoleLayout) -> float:
+            return rollout_capacity(role).lower or 0.0
 
         feasible_actors = [role for role in actors if actor_capacity(role) is not None]
         best = max(
@@ -379,4 +474,13 @@ class Optimizer:
         )
         if best is None:
             return result(None, "Selected GPU split has no placeable candidate")
+        current_bottleneck = min(
+            signal.actor_capacity or 0.0, current_rollout.lower or 0.0
+        )
+        best_bottleneck = min(actor_capacity(best.actor), rollout_lower(best.rollout))
+        if best != current and best_bottleneck <= current_bottleneck:
+            return result(
+                current,
+                "Selected GPU split does not improve bottleneck capacity; keeping current layout",
+            )
         return result(best, "Selected GPU split misses demand; using its best capacity")

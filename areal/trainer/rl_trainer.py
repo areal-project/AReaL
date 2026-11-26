@@ -1014,6 +1014,7 @@ class PPOTrainer:
                 )
                 if self._elastic_controller is not None:
                     self._elastic_controller.on_actor_batch(rollout_batch)
+                    self._elastic_controller.begin_training_step()
             if self._should_offload_rollout:
                 self._offload_rollout()
             elif self._is_v1_awex_colocate(self.config):
@@ -1384,9 +1385,12 @@ class PPOTrainer:
                 global_step=global_step, max_steps=max_steps
             ):
                 if self._elastic_controller is not None:
+                    self._elastic_controller.end_training_step()
                     self._elastic_controller.at_boundary()
                 self.rollout.resume()
             else:
+                if self._elastic_controller is not None:
+                    self._elastic_controller.end_training_step()
                 logger.info(
                     "Skipping rollout resume after final training step "
                     "(global_step=%s)",
