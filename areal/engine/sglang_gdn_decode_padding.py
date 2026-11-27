@@ -123,6 +123,12 @@ DYNAMIC_NEW = """\
 """
 
 _PATCHES = {
+    # SGLang 0.5.20 with the B300 FP32 GDN verify patch.
+    "d7c4837f2f04bfdd6d6e7afd0b5f6824b9a19a5d8c6220ee9eda370061b57df5": (
+        DYNAMIC_OLD,
+        DYNAMIC_NEW,
+        "1e5b391141506b8df5df7b1f687a25a69ac9267de8f4ce9713070f8890cfa9d9",
+    ),
     # SGLang 0.5.19.dev125+g119b5ffe4, FlashInfer 0.6.17.
     "bf788d1a19d71cdb5ff05909a5725a47b7c487d6d06fd4ec1a1c4e551efd984a": (
         PINNED_OLD,

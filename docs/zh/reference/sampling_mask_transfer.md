@@ -95,6 +95,18 @@ SGLang 0.5.20 支持在 `sampling_mask_transfer: true` 时使用
 verify 使用相同的 joint top-k/top-p 分布；verify 仅发布实际提交的 token（包括拒绝时的替代 token 和全接收时的 bonus）的
 mask 和目标 logprob。此模式要求随机采样且不指定请求级 seed。
 
+B300 上运行 Qwen3.5 MoE 时，SGLang 0.5.20 和 FlashInfer 0.6.18 可以用 FP32 SSM 执行 GDN decode
+和固定宽度的 DSpark verify。在 rollout 镜像中从 AReaL 仓库根目录应用补丁：
+
+```bash
+sglang_site=$(python -c 'from importlib.metadata import distribution; print(distribution("sglang").locate_file(""))')
+patch -d "$sglang_site" -p1 < examples/mtp/sglang-0.5.20-b300-fp32-gdn.patch
+```
+
+在 rollout worker 的环境中设置 `AREAL_B300_FLASHINFER_FP32_GDN=1` 和
+`SGLANG_RAGGED_VERIFY_MODE=static`，配置 `sglang.mamba_ssm_dtype: float32` 和
+`sglang.linear_attn_decode_backend: flashinfer`。verify 默认跟随 decode。
+
 当整个 actor TP 组与采样端位于同一共享内存命名空间时，同卡和异卡都可按 rollout 已保存的行号直接读 mask，支持
 TP=1。每个训练分片在批内首次遇到一个来源时查询一次 `/info`，用 producer nonce 校验来源并取得页目录。每页覆盖连续 16,384 个行号，索引每行
 24 字节，记录起始候选位置、候选个数、采样 token 和策略版本。候选区只按实际个数追加 uint24 ID。页号和页内下标均从行号计算。

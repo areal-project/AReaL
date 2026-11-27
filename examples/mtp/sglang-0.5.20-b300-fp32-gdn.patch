@@ -1,0 +1,66 @@
+--- a/sglang/srt/arg_groups/attention_hook.py
++++ b/sglang/srt/arg_groups/attention_hook.py
+@@ -263,8 +263,26 @@
+             "(FlashKDA stays on prefill)."
+         )
+
++    # FlashInfer 0.6.18 supports indexed FP32 GDN decode and fixed-width DSpark verification.
++    allow_fp32_gdn = (
++        os.environ.get("AREAL_B300_FLASHINFER_FP32_GDN") == "1"
++        and decode == "flashinfer"
++        and cfg.mamba_ssm_dtype == "float32"
++        and (
++            cfg.speculative_algorithm is None
++            or (
++                cfg.speculative_algorithm == "DSPARK"
++                and os.environ.get("SGLANG_RAGGED_VERIFY_MODE", "static") == "static"
++                and cfg.speculative_eagle_topk in (None, 1)
++            )
++        )
++        and get_platform().is_cuda
++        and torch.cuda.get_device_capability() == (10, 3)
++        and model_config_of(server_args).hf_config.model_type == "qwen3_5_moe"
++    )
+     if (
+         decode == "flashinfer"
++        and not allow_fp32_gdn
+         and cfg.mamba_ssm_dtype != "bfloat16"
+         and get_platform().is_cuda
+         and torch.cuda.get_device_capability()[0] >= 10
+@@ -280,6 +298,7 @@
+         verify = "flashinfer"
+     if (
+         verify == "flashinfer"
++        and not allow_fp32_gdn
+         and cfg.mamba_ssm_dtype != "bfloat16"
+         and get_platform().is_cuda
+         and torch.cuda.get_device_capability()[0] >= 10
+--- a/sglang/srt/layers/attention/linear/kernels/gdn_flashinfer.py
++++ b/sglang/srt/layers/attention/linear/kernels/gdn_flashinfer.py
+@@ -214,6 +214,7 @@
+         if self._mtp_fn is None:
+             raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
+
++        self._mtp_fp32_fn = self._mtp_fn
+         if self.use_state_pool and mtp_bf16_fn is not None:
+             # Adapt bf16 kernel to fp32 kernel interface so target_verify needs no branching.
+             def _mtp_bf16_adapted(
+@@ -676,12 +677,16 @@
+         b_mtp = self._prepare_dynamic_input(
+             "verify_b", b.view(batch_size, draft_token_num, num_v_heads)
+         )
+-        A_log_fi, dt_bias_fi = self._prepare_gate_parameters(A_log, dt_bias)
++        fp32_state = ssm_states.dtype == torch.float32
++        A_log_fi, dt_bias_fi = self._prepare_gate_parameters(
++            A_log, dt_bias, A_log_dtype=torch.float32 if fp32_state else None
++        )
+         cache_indices_fi = self._prepare_dynamic_input(
+             "verify_cache_indices", cache_indices
+         )
+
+-        output_fi, _ = self._mtp_fn(
++        mtp_fn = self._mtp_fp32_fn if fp32_state else self._mtp_fn
++        output_fi, _ = mtp_fn(
+             q=query_mtp,
+             k=key_mtp,
+             v=value_mtp,
