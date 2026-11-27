@@ -9,14 +9,40 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from vllm.entrypoints.openai.api_server import build_app as _original_build_app
 from vllm.entrypoints.openai.api_server import run_server
-from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.openai.completion.api_router import (
     create_completion as original_create_completion,
 )
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
-from vllm.entrypoints.openai.engine.protocol import ErrorResponse, OpenAIBaseModel
-from vllm.entrypoints.openai.utils import validate_json_request
-from vllm.entrypoints.utils import cli_env_setup, load_aware_call, with_cancellation
+
+try:
+    # vLLM >= 0.32 moved the serve CLI args and shared protocol out of openai/.
+    from vllm.entrypoints.launchers.cli_args import (
+        make_arg_parser,
+        validate_parsed_serve_args,
+    )
+    from vllm.entrypoints.serve.engine.protocol import ErrorResponse, OpenAIBaseModel
+except ImportError:
+    from vllm.entrypoints.openai.cli_args import (
+        make_arg_parser,
+        validate_parsed_serve_args,
+    )
+    from vllm.entrypoints.openai.engine.protocol import ErrorResponse, OpenAIBaseModel
+
+try:
+    # vLLM >= 0.28 (the XPU wheels) moved these into one module.
+    from vllm.entrypoints.serve.utils.api_utils import (
+        cli_env_setup,
+        load_aware_call,
+        validate_json_request,
+        with_cancellation,
+    )
+except ImportError:
+    from vllm.entrypoints.openai.utils import validate_json_request
+    from vllm.entrypoints.utils import (
+        cli_env_setup,
+        load_aware_call,
+        with_cancellation,
+    )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -165,7 +191,7 @@ def _register_runtime_lora_name(
 async def areal_update_weight(request: UpdateWeightsRequest, raw_request: Request):
     logger.info(f"API server starts areal_update_weight, {request.model_path}")
     llm = raw_request.app.state.engine_client
-    await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
+    await llm.pause_generation(mode="abort", clear_cache=True)
     await llm.reset_mm_cache()
     try:
         ret_list = await llm.collective_rpc(
@@ -185,7 +211,7 @@ async def areal_update_weight_lora(
         f"API server starts areal_update_weight_lora, lora_model_path-{request.lora_model_path}, lora_name-{request.lora_name}, lora_int_id-{request.lora_int_id}, base_model_name-{request.base_model_name}"
     )
     llm = raw_request.app.state.engine_client
-    await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
+    await llm.pause_generation(mode="abort", clear_cache=True)
     await llm.reset_mm_cache()
 
     try:
@@ -208,7 +234,7 @@ async def areal_update_weight_lora(
 async def areal_update_weight_xccl(raw_request: Request):
     logger.info("API server starts areal_update_weight_xccl")
     llm = raw_request.app.state.engine_client
-    await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
+    await llm.pause_generation(mode="abort", clear_cache=True)
     await llm.reset_mm_cache()
     try:
         ret_list = await llm.collective_rpc("areal_update_weight_xccl")
@@ -223,7 +249,7 @@ async def areal_update_weight_lora_xccl(
 ):
     logger.info("API server starts areal_update_weight_lora_xccl")
     llm = raw_request.app.state.engine_client
-    await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
+    await llm.pause_generation(mode="abort", clear_cache=True)
     await llm.reset_mm_cache()
 
     try:
@@ -313,7 +339,7 @@ async def areal_pause_generation(raw_request: Request):
     # Abort all running and waiting requests
     _generation_run_event.clear()
     await llm.pause_generation(
-        wait_for_inflight_requests=False,
+        mode="abort",
         clear_cache=True,
     )
     await llm.reset_mm_cache()
@@ -368,7 +394,11 @@ if __name__ == "__main__":
     # NOTE(simon):
     # This section should be in sync with vllm/entrypoints/cli/main.py for CLI
     # entrypoints.
-    import vllm.entrypoints.openai.api_server as _api_server_module
+    import sys
+
+    # Patch build_app where run_server looks it up: vllm.entrypoints.openai.api_server
+    # before vLLM 0.32, vllm.entrypoints.launchers.api_server.entry from 0.32 on.
+    _api_server_module = sys.modules[run_server.__module__]
 
     def _areal_build_app(args, supported_tasks=None, model_config=None):
         """Monkey-patched build_app that replaces vLLM's /v1/completions route
