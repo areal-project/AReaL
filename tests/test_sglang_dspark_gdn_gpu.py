@@ -71,3 +71,33 @@ def test_dspark_verify_commit_then_decode():
 
     for actual, expected in zip(*results):
         torch.testing.assert_close(actual, expected, atol=2e-4, rtol=5e-3)
+
+
+@pytest.mark.parametrize("algorithm", ["DSPARK", "AREAL_DSPARK"])
+@pytest.mark.skipif(
+    os.environ.get("AREAL_B300_FLASHINFER_FP32_GDN") != "1"
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (10, 3),
+    reason="Requires the B300 FP32 FlashInfer GDN rollout environment",
+)
+def test_fixed_width_dspark_accepts_fp32_at_startup(monkeypatch, algorithm):
+    from types import SimpleNamespace
+
+    from sglang.srt.arg_groups import attention_hook
+    from sglang.srt.server_args import ServerArgs
+
+    monkeypatch.setenv("SGLANG_RAGGED_VERIFY_MODE", "static")
+    monkeypatch.setattr(
+        attention_hook,
+        "model_config_of",
+        lambda _: SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5_moe")),
+    )
+    args = ServerArgs(
+        model_path="dummy",
+        device="cuda",
+        speculative_algorithm=algorithm,
+        linear_attn_decode_backend="flashinfer",
+        linear_attn_verify_backend="flashinfer",
+        mamba_ssm_dtype="float32",
+    )
+    attention_hook.handle_linear_attn_backend(args)

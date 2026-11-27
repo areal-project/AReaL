@@ -12,7 +12,7 @@
 +        and (
 +            cfg.speculative_algorithm is None
 +            or (
-+                cfg.speculative_algorithm == "DSPARK"
++                cfg.speculative_algorithm in ("DSPARK", "AREAL_DSPARK")
 +                and os.environ.get("SGLANG_RAGGED_VERIFY_MODE", "static") == "static"
 +                and cfg.speculative_eagle_topk in (None, 1)
 +            )
