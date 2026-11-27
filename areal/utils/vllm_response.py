@@ -6,8 +6,8 @@ from areal.api.io_struct import HttpGenerationResult
 
 # vLLM uses -9999.0 both when a chat logprob is absent and when a lower value
 # is clamped, so the original sampling evidence cannot be recovered:
-# https://github.com/vllm-project/vllm/blob/v0.19.1/vllm/entrypoints/openai/chat_completion/protocol.py#L67-L70
-# https://github.com/vllm-project/vllm/blob/v0.19.1/vllm/entrypoints/openai/chat_completion/serving.py#L1721-L1727
+# https://github.com/vllm-project/vllm/blob/v0.33.0/vllm/entrypoints/openai/chat_completion/protocol.py#L96-L99
+# https://github.com/vllm-project/vllm/blob/v0.33.0/vllm/entrypoints/openai/chat_completion/serving.py#L1257-L1264
 _AMBIGUOUS_VLLM_LOGPROB = -9999.0
 
 
