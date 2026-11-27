@@ -222,6 +222,7 @@ def test_fp8_reader_rebinds_after_offload_before_publishing(
     adapter._initialized = True
     adapter._legacy_reader = reader
     adapter._parameters = dict(current)
+    adapter._qwen35_fp8_receiver = None
     adapter._qwen4_frozen_contract = None
     adapter._rebuild_derived_weights = lambda: events.append(("rebuild", None))
     stale = current["expert.weight"]

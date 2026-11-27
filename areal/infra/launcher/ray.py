@@ -570,11 +570,11 @@ class RayLauncher:
                     r = ray.get(future, timeout=0.1)
                     logger.info(f"Job {job_name} completed with result: {r}")
                     job_status[job_name] = JobState.COMPLETED
-                except ray.exceptions.RayTaskError as e:
-                    logger.error(f"Job {job_name} failed with error: {e}.")
-                    job_status[job_name] = JobState.FAILED
                 except ray.exceptions.GetTimeoutError:
                     continue
+                except ray.exceptions.RayError as e:
+                    logger.error(f"Job {job_name} failed with error: {e}.")
+                    job_status[job_name] = JobState.FAILED
 
             # A failure must win over a completion observed in the same poll.
             for job_name, status in job_status.items():

@@ -524,6 +524,45 @@ class TestRouterEndpoints:
 
         assert routed == [WORKER_1, WORKER_2, WORKER_1]
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "route_body",
+        [
+            pytest.param({"model": "test-model"}, id="model-only"),
+            pytest.param(
+                {"model": "test-model", "api_key": ADMIN_KEY}, id="new-admin-session"
+            ),
+        ],
+    )
+    async def test_route_unbound_request_selects_recovered_model_worker(
+        self, client: httpx.AsyncClient, route_body: dict[str, str]
+    ) -> None:
+        """Only healthy workers registered for the requested model are eligible."""
+        headers = admin_headers()
+        for worker_addr in (WORKER_1, WORKER_2, WORKER_3):
+            response = await client.post(
+                "/register", json={"worker_addr": worker_addr}, headers=headers
+            )
+            assert response.status_code == 200
+        response = await client.post(
+            "/register_model",
+            json={"model": "test-model", "data_proxy_addrs": [WORKER_1, WORKER_2]},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        registry: WorkerRegistry = client._transport.app.state.worker_registry  # type: ignore[attr-defined]
+        await registry.update_health(WORKER_1, False)
+        await registry.update_health(WORKER_2, False)
+
+        response = await client.post("/route", json=route_body, headers=headers)
+        assert response.status_code == 503
+        assert response.json()["detail"] == "No healthy workers"
+
+        await registry.update_health(WORKER_2, True)
+        response = await client.post("/route", json=route_body, headers=headers)
+        assert response.status_code == 200
+        assert response.json()["worker_addr"] == WORKER_2
+
     # ----- /route — session key -----
 
     @pytest.mark.asyncio
@@ -583,7 +622,17 @@ class TestRouterEndpoints:
     # ----- /route — pinned worker unhealthy -----
 
     @pytest.mark.asyncio
-    async def test_route_pinned_worker_unhealthy_still_routes(self, client):
+    @pytest.mark.parametrize(
+        "session_selector",
+        [
+            pytest.param({"api_key": "sess-key-1"}, id="session-key"),
+            pytest.param({"session_id": "task-0-0"}, id="session-id"),
+        ],
+    )
+    async def test_route_pinned_worker_unhealthy_still_routes(
+        self, client: httpx.AsyncClient, session_selector: dict[str, str]
+    ) -> None:
+        """Both session selectors resolve to the worker that holds the session."""
         # Register worker + session
         await client.post(
             "/register",
@@ -609,7 +658,7 @@ class TestRouterEndpoints:
         # Routing still returns the pinned worker even if unhealthy
         resp = await client.post(
             "/route",
-            json={"api_key": "sess-key-1", "path": "/chat/completions"},
+            json={**session_selector, "path": "/chat/completions"},
             headers=admin_headers(),
         )
         assert resp.status_code == 200

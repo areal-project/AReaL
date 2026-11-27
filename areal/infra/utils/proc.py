@@ -129,7 +129,7 @@ def build_streaming_log_cmd(
         sed_prefix = f"stdbuf -oL sed 's/^/{log_prefix}/'"
     else:
         sed_prefix = f"sed 's/^/{log_prefix}/'"
-    shell_cmd = f"{full_cmd} 2>&1 | tee -a {log_file} >({sed_prefix} >> {merged_log})"
+    shell_cmd = f"set -o pipefail; {full_cmd} 2>&1 | tee -a {log_file} >({sed_prefix} >> {merged_log})"
     return shell_cmd
 
 

@@ -24,6 +24,7 @@ import getpass
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import traceback
 from collections.abc import Callable
@@ -412,6 +413,19 @@ def create_app(state: GuardState) -> Flask:
 
                 try:
                     cmd = list(raw_cmd)
+                    # Ray controller and target container may use different
+                    # Python installations. Opt in only for Python modules.
+                    if data.get("use_local_python", False):
+                        if (
+                            data["use_local_python"] is not True
+                            or len(cmd) < 3
+                            or cmd[1] != "-m"
+                            or not Path(cmd[0]).name.startswith("python")
+                        ):
+                            raise ValueError(
+                                "use_local_python requires a Python -m command"
+                            )
+                        cmd[0] = sys.executable
 
                     # Optional per-process environment overrides
                     env_overrides: dict[str, str] = data.get("env", {})

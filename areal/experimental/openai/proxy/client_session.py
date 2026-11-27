@@ -35,6 +35,7 @@ from .server import (
 from .tensor_reference import SharedTensorResolver
 
 if TYPE_CHECKING:
+    from ..finalization import ResponseValidationPolicy
     from ..types import InteractionWithTokenLogpReward
 
 logger = getLogger("OpenAIProxyClient")
@@ -119,6 +120,7 @@ class OpenAIProxyClient:
         self.invalid_tool_json_message = ""
         self.system_error = False
         self.system_error_message = ""
+        self.model_execution_timeout = False
 
     @property
     def session_api_key(self) -> str:
@@ -167,6 +169,7 @@ class OpenAIProxyClient:
         drop_retry_orphans: bool = False,
         is_eval: bool = False,
         episode_reward: float | None = None,
+        response_validation_policy: ResponseValidationPolicy = "final_response",
     ) -> dict[str, InteractionWithTokenLogpReward]:
         """Export interactions for this session via HTTP.
 
@@ -197,6 +200,9 @@ class OpenAIProxyClient:
         episode_reward : float, optional
             Assign an episode return to disjoint concat segments before tensor
             serialization. Applied only when the proxy has no PRM runner.
+        response_validation_policy : {"final_response", "artifact_reward"}
+            Explicitly allow an empty final response for externally scored
+            artifacts. Requires a concat episode reward and no PRM runner.
 
         Returns
         -------
@@ -224,6 +230,8 @@ class OpenAIProxyClient:
         }
         if episode_reward is not None:
             payload["episode_reward"] = episode_reward
+        if response_validation_policy != "final_response":
+            payload["response_validation_policy"] = response_validation_policy
         headers = self._admin_auth_headers()
         async with self._session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
@@ -308,6 +316,9 @@ class OpenAIProxyClient:
             )
             self.system_error = bool(data.get("system_error", False))
             self.system_error_message = str(data.get("system_error_message", ""))
+            self.model_execution_timeout = bool(
+                data.get("model_execution_timeout", False)
+            )
         except Exception as e:
             # Raised errors will be properly handled by OpenAIProxyWorkflow
             logger.warning(f"Failed to end session {self.session_id}: {e}")

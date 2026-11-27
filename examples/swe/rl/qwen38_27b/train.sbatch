@@ -83,12 +83,12 @@ stream_ids = re.findall(r"^    stream_id: ([^\s'\"]+)", config_path.read_text(),
 if not model_names:
     print("Arena child cleanup: no registered Arena models in this trial", flush=True)
     raise SystemExit(0)
-if len(stream_ids) != 1:
-    raise RuntimeError("Cannot identify this trial's Arena Stream")
+if not stream_ids:
+    raise RuntimeError("Cannot identify this trial's Arena Streams")
 
 base = os.environ["ARENA_OPENAPI_BASE"].rstrip("/")
 headers = {"Authorization": "Bearer " + os.environ["ARENA_OPENAPI_TOKEN"]}
-stream_id = urllib.parse.quote(stream_ids[0], safe="")
+stream_ids = sorted(set(stream_ids))
 
 
 def request(method, url):
@@ -98,7 +98,9 @@ def request(method, url):
 
 
 def active_job_ids():
-    def list_status(status):
+    def list_status(target):
+        stream_name, status = target
+        stream_id = urllib.parse.quote(stream_name, safe="")
         found = set()
         offset = 0
         while True:
@@ -122,7 +124,8 @@ def active_job_ids():
     # Query independent states together so the TERM trap can finish in time.
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         parts = pool.map(
-            list_status, ("PENDING", "RUNNING", "AGGREGATING", "STOPPING")
+            list_status, ((stream, status) for stream in stream_ids
+                          for status in ("PENDING", "RUNNING", "AGGREGATING", "STOPPING"))
         )
         return set().union(*parts)
 

@@ -41,9 +41,12 @@ from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding, stats_tracker
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.errors import ModelExecutionTimeoutError
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, gethostip
+from areal.v2.inference_service.router.backend import RoutingError
+from areal.v2.inference_service.router.client import backend_session
 
 from .server import (
     ANTHROPIC_MESSAGES_PATHNAME,
@@ -118,6 +121,8 @@ def _warn_once(msg: str) -> None:
 # Engine and client (created via /create_engine and /call with method "initialize")
 _engine: InferenceEngine | None = None
 _openai_client: ArealOpenAI | None = None
+# Set only while this proxy worker is paused. All waiters share its resume signal.
+_resume_streams: asyncio.Event | None = None
 _prm_runner = None
 
 # Session management
@@ -327,8 +332,9 @@ app = FastAPI()
 
 
 @app.exception_handler(InvalidToolCallError)
+@app.exception_handler(ModelExecutionTimeoutError)
 async def invalid_tool_call_error_response(
-    _request: Request, exc: InvalidToolCallError
+    _request: Request, exc: InvalidToolCallError | ModelExecutionTimeoutError
 ) -> JSONResponse:
     """Return a protocol-native, explicitly non-retryable model error."""
     return JSONResponse(
@@ -348,6 +354,9 @@ async def invalid_tool_call_error_response(
 def _reject_retry_after_invalid_tool_call(session_id: str) -> None:
     with _lock:
         invalid_tool_error = _session_invalid_tool_errors.get(session_id)
+        session = _session_cache.get(session_id)
+    if session is not None and session.model_execution_timeout:
+        raise ModelExecutionTimeoutError()
     if invalid_tool_error is not None:
         logger.warning(
             "Rejecting retry for session %s after invalid tool JSON", session_id
@@ -520,7 +529,7 @@ async def create_engine(raw_request: Request):
 
 @app.post("/call")
 async def call_engine_method(raw_request: Request):
-    global _engine, _openai_client
+    global _engine, _openai_client, _resume_streams
     if _engine is None:
         raise HTTPException(status_code=400, detail="Engine not initialized")
 
@@ -534,6 +543,11 @@ async def call_engine_method(raw_request: Request):
 
     if method_name == "initialize":
         _setup_openai_client()
+    elif method_name == "pause" and _resume_streams is None:
+        _resume_streams = asyncio.Event()
+    elif method_name == "resume" and _resume_streams is not None:
+        _resume_streams.set()
+        _resume_streams = None
 
     return {"status": "success", "result": serialize_value(result)}
 
@@ -557,7 +571,7 @@ def grant_capacity():
 # =============================================================================
 
 
-def _cleanup_stale_sessions():
+def _cleanup_stale_sessions() -> list[str]:
     """Remove stale sessions and orphaned API key mappings.
 
     Called periodically (at most once per minute) during start_session to clean up
@@ -574,7 +588,7 @@ def _cleanup_stale_sessions():
     # Only run cleanup at most once per minute
     current_time = time.time()
     if current_time - _last_cleanup_time < 60:
-        return
+        return []
 
     _last_cleanup_time = current_time
 
@@ -583,11 +597,17 @@ def _cleanup_stale_sessions():
         if session_data.is_stale(timeout_seconds=_session_timeout_seconds):
             stale_sessions.append(session_id)
 
+    closed_backend_sessions = []
     for session_id in stale_sessions:
         logger.warning(f"Removing stale session: {session_id}")
         session_data = _session_cache.pop(session_id, None)
         _session_invalid_tool_errors.pop(session_id, None)
         if session_data is not None:
+            if getattr(_engine, "route_client", None) is not None:
+                _engine.route_client.close_local_session(
+                    session_data.backend_session_id
+                )
+                closed_backend_sessions.append(session_data.backend_session_id)
             cache_group_id = session_data.take_processor_cache_group_id()
             if cache_group_id is not None:
                 _processor_cache_registry.release(cache_group_id)
@@ -609,10 +629,11 @@ def _cleanup_stale_sessions():
         _remove_api_keys_for_session(sid)
     if orphaned_sids:
         logger.info(f"Cleaned up {len(orphaned_sids)} orphaned API key mappings")
+    return closed_backend_sessions
 
 
 @app.post(f"/{RL_START_SESSION_PATHNAME}", dependencies=[Depends(_require_admin_key)])
-def start_session(request: StartSessionRequest) -> StartSessionResponse:
+async def start_session(request: StartSessionRequest) -> StartSessionResponse:
     """Start a new RL session and allocate a unique session API key.
 
     If ``request.api_key`` is provided, reuse that key instead of generating
@@ -634,8 +655,11 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
 
     with _lock:
         # Periodically cleanup stale sessions
-        _cleanup_stale_sessions()
+        closed_backend_sessions = _cleanup_stale_sessions()
+    for backend_id in closed_backend_sessions:
+        await _engine.close_backend_session(backend_id)
 
+    with _lock:
         if _capacity <= 0:
             raise HTTPException(
                 status_code=429,
@@ -699,7 +723,7 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
 
 
 @app.post(f"/{RL_END_SESSION_PATHNAME}")
-def end_session(session_id: str = Depends(_require_session_key)):
+async def end_session(session_id: str = Depends(_require_session_key)):
     """End an RL session.
 
     Returns the number of recorded interactions so callers (e.g. the proxy
@@ -715,6 +739,8 @@ def end_session(session_id: str = Depends(_require_session_key)):
         interaction_count = len(session.completions)
         invalid_tool_json_message = _session_invalid_tool_errors.get(session_id, "")
 
+    if getattr(_engine, "route_client", None) is not None:
+        await _engine.close_backend_session(session.backend_session_id)
     # finish() outside lock to avoid holding lock during potential I/O
     session.finish()
     cache_group_id = session.take_processor_cache_group_id()
@@ -729,6 +755,7 @@ def end_session(session_id: str = Depends(_require_session_key)):
         "invalid_tool_json_message": invalid_tool_json_message,
         "system_error": session.system_error,
         "system_error_message": session.system_error_message,
+        "model_execution_timeout": session.recoverable_model_execution_timeout,
     }
 
 
@@ -836,6 +863,47 @@ def _content_block_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def _auxiliary_system_prompt(
+    kwargs: dict[str, Any], *, responses_api: bool
+) -> str | None:
+    """Recognize a sole leading instruction without hiding additional guidance."""
+    # Session defaults can include fields from the other API. Only inspect
+    # instructions consumed by the endpoint handling this request.
+    instructions = kwargs.get("instructions") if responses_api else None
+    system_prompt = (
+        instructions if isinstance(instructions, str) and instructions.strip() else None
+    )
+    prompts = [system_prompt] if system_prompt is not None else []
+    messages_key = "input" if responses_api else "messages"
+    messages = kwargs.get(messages_key)
+    if isinstance(messages, list):
+        # Responses content can also be a lazily validated iterator. Retain its
+        # materialized value for generation rather than consuming it only here.
+        messages = list(messages)
+        kwargs[messages_key] = messages
+        for index, message in enumerate(messages):
+            if not isinstance(message, Mapping) or message.get("role") not in {
+                "system",
+                "developer",
+            }:
+                continue
+            content = message.get("content")
+            if content is None:
+                continue
+            if isinstance(content, Iterable) and not isinstance(
+                content, (str, Mapping)
+            ):
+                content = list(content)
+                messages[index] = {**message, "content": content}
+            text = _content_block_text(content)
+            if not text.strip():
+                continue
+            prompts.append(text)
+            if index == 0 and message.get("role") == "system" and system_prompt is None:
+                system_prompt = text
+    return system_prompt if len(prompts) == 1 else None
+
+
 def _flatten_text_content_lists(messages: list[dict]) -> None:
     """Flatten text-only content block lists to strings in-place.
 
@@ -923,6 +991,10 @@ def _backend_context_length_message(error: Exception) -> str | None:
                 or message.startswith(
                     "Requested token count exceeds the model's maximum context length"
                 )
+                or message.startswith(
+                    "Multimodal prompt is too long after expanding multimodal tokens. "
+                    "After expanding len(req.origin_input_ids_unpadded)="
+                )
                 or (
                     message.startswith("The input (")
                     and "is longer than the model's context length (" in message
@@ -940,6 +1012,7 @@ async def _call_client_create(
     session_id: str,
     extra_ignored_args: list[str] | None = None,
     stream: bool = False,
+    responses_api: bool = False,
 ) -> ChatCompletion | Response | AsyncGenerator[ChatCompletionChunk, None]:
     """Common logic for chat completions and responses."""
     if _openai_client is None:
@@ -991,6 +1064,44 @@ async def _call_client_create(
         if isinstance(request, BaseModel) and key not in request.model_fields_set:
             kwargs.pop(key, None)
         kwargs.setdefault(key, value)
+
+    try:
+        # FastAPI validates OpenAI Iterable fields lazily. An empty tools
+        # iterator is truthy; materialize it after merging defaults. Validation
+        # can fail here before a call can safely be classified as auxiliary.
+        for key in ("tools", "input" if responses_api else "messages"):
+            value = kwargs.get(key)
+            if isinstance(value, Iterable) and not isinstance(
+                value, (str, Mapping, list)
+            ):
+                kwargs[key] = list(value)
+        auxiliary_prompts = session_data.metadata.get("auxiliary_system_prompts", [])
+        system_prompt = _auxiliary_system_prompt(kwargs, responses_api=responses_api)
+        is_auxiliary = (
+            isinstance(auxiliary_prompts, list)
+            and isinstance(system_prompt, str)
+            and system_prompt in auxiliary_prompts
+            and not kwargs.get("tools")
+        )
+    except Exception as e:
+        message = f"{type(e).__name__}: {e}"
+        session_data.mark_system_error(message)
+        logger.exception("Failed to normalize proxy request for classification")
+        raise HTTPException(status_code=500, detail=message) from e
+    if is_auxiliary:
+        # Serve explicitly identified auxiliary calls without adding a reward
+        # target or failure state to the task's training trajectory.
+        auxiliary_session = SessionData(
+            session_id=session_id,
+            sampling_seed_identity=session_data.sampling_seed_identity,
+            processor_cache=session_data.processor_cache,
+            metadata=session_data.metadata,
+        )
+        auxiliary_session.backend_session_id = session_data.backend_session_id
+        session_data = auxiliary_session
+        logger.info(
+            "Serving auxiliary request outside training cache: session=%s", session_id
+        )
 
     messages = kwargs.get("messages")
     if messages is not None:
@@ -1111,6 +1222,7 @@ async def _call_client_create(
     if stream:
         kwargs["stream"] = True
 
+    session_data.begin_model_request()
     try:
         client_kwargs: dict[str, Any] = {
             "areal_cache": session_data.completions,
@@ -1118,13 +1230,32 @@ async def _call_client_create(
         }
         if supports_processor_cache:
             client_kwargs["processor_cache"] = session_data.processor_cache
-        return await create_fn(**client_kwargs)
+        async with backend_session(
+            _engine, session_data.backend_session_id, close=False
+        ):
+            return await create_fn(**client_kwargs)
+    except asyncio.CancelledError:
+        # RouteClient shields dispatched generation and retains its lease after
+        # the caller leaves. Ending this proxy request cannot establish that the
+        # backend stopped, even if a later request confirms a running timeout.
+        session_data.mark_model_request_cancelled()
+        raise
+    except ModelExecutionTimeoutError:
+        session_data.mark_model_execution_timeout()
+        logger.warning("Session %s exceeded the model running timeout", session_id)
+        raise
+    except RoutingError as e:
+        session_data.mark_system_error(str(e))
+        # 409 is intentionally not an SDK-transparent retry status. A metadata
+        # lease cannot make an uncertain generation safe to replay.
+        raise HTTPException(status_code=409, detail={"code": e.code}) from e
     except InvalidToolCallError as exc:
         # A streaming response has already sent HTTP 200 by the time the model
         # output can be validated. Poison the session so an SDK retry receives
         # a real HTTP 422 before it starts another model generation.
-        with _lock:
-            _session_invalid_tool_errors[session_id] = str(exc)
+        if not is_auxiliary:
+            with _lock:
+                _session_invalid_tool_errors[session_id] = str(exc)
         logger.warning("Session %s emitted invalid tool JSON", session_id)
         raise
     except ContextLengthExceededError as e:
@@ -1160,6 +1291,8 @@ async def _call_client_create(
         session_data.mark_system_error(f"{type(e).__name__}: {e}")
         logger.exception("AReaL client request failed")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    finally:
+        session_data.end_model_request()
 
 
 @app.post(
@@ -1246,14 +1379,18 @@ async def _deferred_openai_sse_stream(
     }
     yield f"data: {json.dumps(initial_chunk, separators=(',', ':'))}\n\n"
 
-    create_task = asyncio.create_task(
-        _call_client_create(
+    async def create_when_resumed():
+        # The trainer can pause again before a woken request gets to run.
+        while _resume_streams is not None:
+            await _resume_streams.wait()
+        return await _call_client_create(
             create_fn=_openai_client.chat.completions.create,
             request=request,
             session_id=session_id,
             stream=True,
         )
-    )
+
+    create_task = asyncio.create_task(create_when_resumed())
     openai_stream: AsyncGenerator[ChatCompletionChunk, None] | None = None
     real_completion_id: str | None = None
     try:
@@ -1275,7 +1412,10 @@ async def _deferred_openai_sse_stream(
                 if real_completion_id != stream_id:
                     with _lock:
                         session = _session_cache.get(session_id)
-                        if session is not None:
+                        if (
+                            session is not None
+                            and real_completion_id in session.completions
+                        ):
                             session.stream_completion_aliases[stream_id] = (
                                 real_completion_id
                             )
@@ -1286,13 +1426,13 @@ async def _deferred_openai_sse_stream(
         yield "data: [DONE]\n\n"
     except asyncio.CancelledError:
         raise
-    except InvalidToolCallError as exc:
+    except (InvalidToolCallError, ModelExecutionTimeoutError) as exc:
         # The HTTP response has already started so the FastAPI exception
         # handler cannot return its 422 response here. Preserve the same
         # non-retryable error semantics in the OpenAI SSE payload; otherwise
         # downstream gateways classify this as a retryable server_error and
         # Claude Code silently retries the malformed model action.
-        logger.warning("Ending stream after invalid tool JSON: %s", exc)
+        logger.warning("Ending stream after non-retryable model failure: %s", exc)
         error = {
             "error": {
                 "message": str(exc),
@@ -1353,6 +1493,7 @@ async def responses(
         create_fn=_openai_client.responses.create,
         request=request,
         session_id=session_id,
+        responses_api=True,
     )
 
 
@@ -1506,7 +1647,7 @@ async def anthropic_messages(
                     "X-Accel-Buffering": "no",
                 },
             )
-        except (HTTPException, InvalidToolCallError):
+        except (HTTPException, InvalidToolCallError, ModelExecutionTimeoutError):
             raise
         except Exception as e:
             # Clean up stream on error during setup
@@ -1601,6 +1742,13 @@ async def export_trajectories(
 
     # Apply the task return before final-response validation.
     export_kwargs = {}
+    if request.response_validation_policy != "final_response":
+        if request.episode_reward is None or _prm_runner is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Artifact reward policy requires an episode reward and no PRM",
+            )
+        export_kwargs["response_validation_policy"] = request.response_validation_policy
     if request.episode_reward is not None and _prm_runner is None:
         export_kwargs["episode_reward"] = request.episode_reward
     elif request.episode_reward is not None:

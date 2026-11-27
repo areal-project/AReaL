@@ -428,8 +428,10 @@ def test_wait_results_selects_completed_tasks_when_deterministic():
     dispatcher.consume_result = lambda result: result
     dispatcher.deterministic_order = True
     dispatcher.terminal_error_fn = None
+    dispatcher.health_check = None
     dispatcher._result_cv = threading.Condition()
     dispatcher._active_task_ids = {0, 1, 2}
+    dispatcher._task_callbacks = {task_id: "callback" for task_id in range(3)}
     dispatcher._pending_results = {
         1: _FakeTimedResult(task_id=1, create_time=1.0, data="one"),
         2: _FakeTimedResult(task_id=2, create_time=2.0, data="two"),
@@ -441,6 +443,7 @@ def test_wait_results_selects_completed_tasks_when_deterministic():
     assert results == ["one", "two"]
     assert dispatcher._pending_results == {}
     assert dispatcher._active_task_ids == {0}
+    assert dispatcher._task_callbacks == {0: "callback"}
 
 
 def test_wait_for_task_removes_result_before_deterministic_batch_selection():
@@ -448,8 +451,10 @@ def test_wait_for_task_removes_result_before_deterministic_batch_selection():
     dispatcher.consume_result = lambda result: result
     dispatcher.deterministic_order = True
     dispatcher.terminal_error_fn = None
+    dispatcher.health_check = None
     dispatcher._result_cv = threading.Condition()
     dispatcher._active_task_ids = {0, 1, 2}
+    dispatcher._task_callbacks = {task_id: "callback" for task_id in range(3)}
     dispatcher._pending_results = {
         task_id: _FakeTimedResult(task_id, float(task_id), str(task_id))
         for task_id in range(3)
@@ -457,7 +462,9 @@ def test_wait_for_task_removes_result_before_deterministic_batch_selection():
     dispatcher._check_thread_exception = lambda: None
 
     assert dispatcher.wait_for_task(1, timeout=0) == "1"
+    assert dispatcher._task_callbacks == {0: "callback", 2: "callback"}
     assert dispatcher.wait_results(2, timeout=0) == ["0", "2"]
+    assert not dispatcher._task_callbacks
 
 
 def test_responses_and_completions_both_accept_seed():

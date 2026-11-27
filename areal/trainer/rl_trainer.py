@@ -212,7 +212,12 @@ class PPOTrainer:
                 "created workers",
                 exc_info=True,
             )
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                logger.warning(
+                    "Cleanup failed after trainer construction error", exc_info=True
+                )
             raise
 
     def _init_impl(
@@ -221,6 +226,10 @@ class PPOTrainer:
         train_dataset: Dataset | None = None,
         valid_dataset: Dataset | None = None,
     ):
+        if config.rollout.backend_routing.enabled and (
+            config.rollout._version != "v1" or not is_single_controller()
+        ):
+            raise ValueError("Backend routing requires v1 single-controller mode")
         rank = int(os.getenv("RANK", "0"))
         if is_single_controller():
             # Set up file logging for controller process
@@ -815,6 +824,9 @@ class PPOTrainer:
             if cleanup_error is None:
                 cleanup_error = exc
 
+        if cleanup_error is not None:
+            raise cleanup_error
+
         try:
             with (
                 stats_tracker.record_timing("rollout_resume"),
@@ -851,7 +863,10 @@ class PPOTrainer:
         eval_workflow_kwargs: dict[str, Any] | None = None,
         dynamic_filter_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         total_epochs: int | None = None,
+        dynamic_filter_kwargs: dict[str, Any] | None = None,
     ):
+        if dynamic_filter_kwargs and dynamic_filter_fn is None:
+            raise ValueError("dynamic_filter_kwargs requires dynamic_filter_fn")
         config = self.config
         is_v1_rollout = config.rollout._version == "v1"
         if (
@@ -958,6 +973,8 @@ class PPOTrainer:
                     drop_incomplete_group=config.gconfig.drop_incomplete_group,
                     min_usable_group_size=min_usable_group_size,
                 )
+                if dynamic_filter_kwargs:
+                    prepare_kwargs["should_accept_kwargs"] = dynamic_filter_kwargs
                 if is_v1_rollout:
                     prepare_kwargs["reward_normalization_use_std"] = (
                         config.gconfig.reward_normalization_use_std
@@ -1440,7 +1457,10 @@ class PPOTrainer:
                     logger.warning(
                         f"{attr}.destroy() failed during close", exc_info=True
                     )
-        perf_tracer.save(force=True)
+        try:
+            perf_tracer.save(force=True)
+        except Exception:
+            logger.warning("perf_tracer.save() failed during close", exc_info=True)
 
     def _config_perf_tracer(self):
         rank = int(os.getenv("RANK", "0"))
@@ -1743,6 +1763,8 @@ class PPOTrainer:
             assert len(self.rollout.server_infos) > 0
             init_kwargs["server_infos"] = self.rollout.server_infos
             init_kwargs["role"] = "eval-rollout"
+            if config._version == "v1" and config.backend_routing.enabled:
+                init_kwargs["backend_router_owner"] = self.rollout
         controller.initialize(**init_kwargs)
         return controller
 
@@ -1887,6 +1909,24 @@ class PPOTrainer:
         eval_workflow: WorkflowLike,
         eval_workflow_kwargs,
     ):
+        routed = self.config.rollout.backend_routing.enabled
+        if routed:
+            # Both controllers own the same physical pool. Evaluation is an
+            # exclusive sender phase even without memory offloading (including
+            # evaluate-before-train); restore only the eval member here.
+            self.eval_rollout.pause()
+            self.eval_rollout.resume()
+        try:
+            self._collect_eval_results(eval_workflow, eval_workflow_kwargs)
+        finally:
+            if routed:
+                self.eval_rollout.pause()
+
+    def _collect_eval_results(
+        self,
+        eval_workflow: WorkflowLike,
+        eval_workflow_kwargs,
+    ):
         if self.actor.is_data_parallel_head():
             cnt = 0
             for data in self.valid_dataloader:
@@ -1944,6 +1984,12 @@ class PPOTrainer:
                     self._offload_rollout(is_eval=True)
 
         evaluated = self.evaluator.evaluate_before_train(evaluate_fn)
+        if (
+            evaluated
+            and self.config.rollout.backend_routing.enabled
+            and not self._should_offload_rollout
+        ):
+            self.rollout.resume()
         if evaluated and not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
@@ -2279,5 +2325,10 @@ class PPOTrainer:
     def __exit__(self, exc_type, exc_value, traceback):
         if exc_type is not None:
             logger.error(f"Training failed with exception: {exc_value}", exc_info=True)
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            if exc_type is None:
+                raise
+            logger.warning("Cleanup failed after training error", exc_info=True)
         return False

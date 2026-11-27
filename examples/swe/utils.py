@@ -1,6 +1,7 @@
 """Utilities for SWE-bench agent training with AReaL."""
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from examples.swe.arena_types import ArenaRewardRefConfig as ArenaRewardRefConfig
 from examples.swe.arena_types import ArenaStreamConfig
@@ -24,6 +25,8 @@ class SWEEnvConfig:
         llm_model: Optional LLM model override for OH/OpenCode/Codex agents.
         opencode_provider: Optional OpenCode provider override.
         codex_provider: Optional Codex provider override.
+        arena_auxiliary_system_prompts: Exact system prompts identifying tool-free
+            model calls to exclude from training trajectories. Empty disables exclusion.
         step_limit: Maximum number of agent interaction steps per episode.
         max_completion_tokens: Maximum completion tokens for the agent LLM.
         timeout: Maximum time allowed for a single episode in seconds.
@@ -103,6 +106,12 @@ class SWEEnvConfig:
             "help": "Maximum serialized Arena raw payload bytes per audit record."
         },
     )
+    arena_log_per_task_reward: bool = field(
+        default=False,
+        metadata={
+            "help": "Emit a separate raw reward metric for each Arena dataset task."
+        },
+    )
     arena_base_url: str = field(
         default="",
         metadata={
@@ -160,6 +169,16 @@ class SWEEnvConfig:
                 "an OpenAI Chat Completions upstream."
             ),
             "choices": ["", "anthropic", "responses", "chat_completions"],
+        },
+    )
+    arena_auxiliary_system_prompts: list[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Exact system prompts identifying tool-free auxiliary model calls "
+                "to exclude from training trajectories. Supports Chat Completions "
+                "system messages and Responses instructions. Empty disables exclusion."
+            )
         },
     )
     arena_harness: str = field(
@@ -292,3 +311,18 @@ class SWEPPOConfig(PPOConfig):
             "help": "Import path of the filter function for accepting rollout samples."
         },
     )
+    should_accept_kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Keyword arguments for should_accept_fn, such as min_accuracy and max_accuracy."
+        },
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.should_accept_kwargs and self.should_accept_fn is None:
+            raise ValueError("should_accept_kwargs requires should_accept_fn")
+        if self.should_accept_fn == "examples.swe.filter_function.filter_by_accuracy":
+            from examples.swe.filter_function import validate_accuracy_filter
+
+            validate_accuracy_filter(**self.should_accept_kwargs)

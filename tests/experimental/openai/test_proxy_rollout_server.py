@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from copy import deepcopy
@@ -35,6 +36,582 @@ from areal.utils import stats_tracker
 # ---------------------------------------------------------------------------
 
 _ADMIN_KEY = "test-admin-key"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exclude_auxiliary", [False, True])
+@pytest.mark.parametrize("content_blocks", [False, True])
+async def test_auxiliary_title_cannot_replace_successful_task_reward(
+    monkeypatch, exclude_auxiliary, content_blocks
+):
+    """A reasoning-only title after a valid solve must not zero its reward."""
+    title_prompt = "Generate a session title from the completed conversation."
+    metadata = {"auxiliary_system_prompts": [title_prompt]} if exclude_auxiliary else {}
+    session = SessionData(session_id="task", metadata=metadata)
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+
+    async def create_fn(messages, areal_cache, **kwargs):
+        is_title = messages[0]["content"] == title_prompt
+        key = "title" if is_title else "solve"
+        interaction = _prm_interaction(key, [1], [2], messages)
+        interaction.reward = None
+        interaction.metadata["response_parse"] = {
+            "tool_call_parse_failed": False,
+            "has_content": not is_title,
+            "has_tool_calls": False,
+        }
+        areal_cache[key] = interaction
+        return key
+
+    assert (
+        await srv._call_client_create(
+            create_fn,
+            {"messages": [{"role": "user", "content": "Write verifier.py"}]},
+            "task",
+        )
+        == "solve"
+    )
+    assert (
+        await srv._call_client_create(
+            create_fn,
+            {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": title_prompt}]
+                        if content_blocks
+                        else title_prompt,
+                    }
+                ]
+            },
+            "task",
+        )
+        == "title"
+    )
+    session.completions.set_reward("solve" if exclude_auxiliary else "title", 1.0)
+    exported = session.export_interactions(
+        discount=1.0, style="concat", episode_reward=1.0
+    )
+    assert set(exported) == ({"solve"} if exclude_auxiliary else {"solve", "title"})
+    assert exported["solve"].reward == (1.0 if exclude_auxiliary else 0.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_tools", [False, True])
+async def test_auxiliary_failure_is_isolated_only_for_tool_free_matching_requests(
+    monkeypatch, with_tools
+):
+    from fastapi import HTTPException
+
+    session = SessionData(
+        session_id="task", metadata={"auxiliary_system_prompts": ["Title request"]}
+    )
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+
+    async def create_fn(messages, tools=None, **kwargs):
+        raise RuntimeError("generation failed")
+
+    request = {"messages": [{"role": "system", "content": "Title request"}]}
+    if with_tools:
+        request["tools"] = [{"type": "function", "function": {"name": "solve"}}]
+    with pytest.raises(HTTPException):
+        await srv._call_client_create(create_fn, request, "task")
+    assert session.system_error is with_tools
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exclude_auxiliary", [False, True])
+@pytest.mark.parametrize("title_shape", ["instructions", "input_system"])
+async def test_responses_auxiliary_title_preserves_task_reward(
+    monkeypatch, exclude_auxiliary, title_shape
+):
+    metadata = {"auxiliary_system_prompts": ["Title"]} if exclude_auxiliary else {}
+    session = SessionData(session_id="task", metadata=metadata)
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+
+    async def create_fn(input, areal_cache, instructions=None, **kwargs):
+        is_title = instructions == "Title" or isinstance(input, list)
+        key = "title" if is_title else "solve"
+        messages = [{"role": "user", "content": "request"}]
+        interaction = _prm_interaction(key, [1], [2], messages)
+        interaction.reward = None
+        interaction.metadata["response_parse"] = {
+            "tool_call_parse_failed": False,
+            "has_content": not is_title,
+            "has_tool_calls": False,
+        }
+        areal_cache[key] = interaction
+        return key
+
+    monkeypatch.setattr(
+        srv,
+        "_openai_client",
+        SimpleNamespace(responses=SimpleNamespace(create=create_fn)),
+    )
+    assert await srv.responses({"input": "Write verifier.py"}, "task") == "solve"
+    title_request = (
+        {"instructions": "Title", "input": "Summarize"}
+        if title_shape == "instructions"
+        else {
+            "input": [
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "Title"}],
+                }
+            ]
+        }
+    )
+    assert await srv.responses(title_request, "task") == "title"
+    session.completions.set_reward("solve" if exclude_auxiliary else "title", 1.0)
+    exported = session.export_interactions(
+        discount=1.0, style="concat", episode_reward=1.0
+    )
+    assert set(exported) == ({"solve"} if exclude_auxiliary else {"solve", "title"})
+    assert exported["solve"].reward == (1.0 if exclude_auxiliary else 0.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["chat", "responses"])
+@pytest.mark.parametrize("disable_default_tools", [False, True])
+async def test_auxiliary_policy_checks_effective_session_tools(
+    monkeypatch, protocol, disable_default_tools
+):
+    tools = [{"type": "function", "function": {"name": "solve"}}]
+    session = SessionData(
+        session_id="task",
+        metadata={
+            "auxiliary_system_prompts": ["Title"],
+            "generation_args": {"tools": tools},
+        },
+    )
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+    observed = []
+
+    async def create_fn(
+        areal_cache, messages=None, instructions=None, tools=None, **kwargs
+    ):
+        observed.append((areal_cache, tools))
+
+    request = (
+        {"messages": [{"role": "system", "content": "Title"}]}
+        if protocol == "chat"
+        else {"instructions": "Title", "input": "Summarize"}
+    )
+    if disable_default_tools:
+        request["tools"] = []
+    await srv._call_client_create(
+        create_fn, request, "task", responses_api=protocol == "responses"
+    )
+    cache, effective_tools = observed[0]
+    assert effective_tools == ([] if disable_default_tools else tools)
+    assert (cache is session.completions) is not disable_default_tools
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_tools", [False, True])
+async def test_responses_http_auxiliary_materializes_tools(monkeypatch, with_tools):
+    """FastAPI's lazy tools iterator must retain both emptiness and tool values."""
+    from fastapi.responses import JSONResponse
+
+    tool = {
+        "type": "function",
+        "name": "solve",
+        "parameters": {"type": "object"},
+        "strict": False,
+    }
+    session = SessionData(
+        session_id="task",
+        metadata={
+            "auxiliary_system_prompts": ["Title"],
+            "generation_args": {"tools": [tool]},
+        },
+    )
+    session.completions["solve"] = _prm_interaction("solve", [1], [2], [])
+    observed = []
+
+    async def create(input, areal_cache, tools=None, **kwargs):
+        observed.append(list(tools))
+        interaction = _prm_interaction("title", [3], [4], [])
+        interaction.reward = None
+        interaction.metadata["response_parse"] = {
+            "has_content": with_tools,
+            "has_tool_calls": False,
+            "tool_call_parse_failed": False,
+        }
+        areal_cache["title"] = interaction
+        return JSONResponse({"id": "title"})
+
+    monkeypatch.setattr(
+        srv, "_openai_client", SimpleNamespace(responses=SimpleNamespace(create=create))
+    )
+    srv._session_cache["task"] = session
+    srv._api_key_to_session["task-key"] = "task"
+    headers = {"Authorization": "Bearer task-key"}
+    async with _client() as client:
+        response = await client.post(
+            "/responses",
+            headers=headers,
+            json={
+                "model": "test",
+                "instructions": "Title",
+                "input": "Summarize",
+                "tools": [tool] if with_tools else [],
+            },
+        )
+        assert response.status_code == 200, response.text
+        rewarded = await client.post(
+            "/rl/set_reward", headers=headers, json={"reward": 1.0}
+        )
+    assert rewarded.status_code == 200
+    assert observed == [[tool] if with_tools else []]
+    exported = session.export_interactions(
+        discount=1.0, style="concat", episode_reward=1.0
+    )
+    assert set(exported) == ({"solve", "title"} if with_tools else {"solve"})
+    assert exported["title" if with_tools else "solve"].reward == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint,payload,auxiliary",
+    [
+        (
+            "/v1/chat/completions",
+            {
+                "messages": [
+                    {"role": "system", "content": "Title"},
+                    {"role": "system", "content": "Solve"},
+                ]
+            },
+            False,
+        ),
+        (
+            "/v1/chat/completions",
+            {
+                "messages": [
+                    {"role": "system", "content": "Title"},
+                    {"role": "developer", "content": "Solve"},
+                ]
+            },
+            False,
+        ),
+        (
+            "/v1/chat/completions",
+            {
+                "messages": [
+                    {"role": "system", "content": "Title"},
+                    {"role": "system", "content": ""},
+                ]
+            },
+            True,
+        ),
+        (
+            "/v1/chat/completions",
+            {
+                "messages": [
+                    {"role": "user", "content": "Solve"},
+                    {"role": "system", "content": "Title"},
+                ]
+            },
+            False,
+        ),
+        (
+            "/responses",
+            {
+                "instructions": "Title",
+                "input": [{"role": "system", "content": "Solve"}],
+            },
+            False,
+        ),
+        (
+            "/responses",
+            {
+                "instructions": "Title",
+                "input": [{"role": "developer", "content": "Solve"}],
+            },
+            False,
+        ),
+        (
+            "/responses",
+            {
+                "instructions": "",
+                "input": [
+                    {
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": "Title"}],
+                    }
+                ],
+            },
+            True,
+        ),
+        (
+            "/responses",
+            {"instructions": "  ", "input": [{"role": "system", "content": "Title"}]},
+            True,
+        ),
+        ("/responses", {"input": [{"role": "system", "content": "Title"}]}, True),
+    ],
+)
+async def test_auxiliary_http_requires_one_unambiguous_instruction(
+    monkeypatch, endpoint, payload, auxiliary
+):
+    """Extra instructions retain training; empty instructions cannot hide a title."""
+    from fastapi.responses import JSONResponse
+
+    session = SessionData(
+        session_id="task", metadata={"auxiliary_system_prompts": ["Title"]}
+    )
+    session.completions["solve"] = _prm_interaction("solve", [1], [2], [])
+
+    async def create(
+        areal_cache, messages=None, input=None, instructions=None, **kwargs
+    ):
+        interaction = _prm_interaction("followup", [3], [4], [])
+        interaction.reward = None
+        interaction.metadata["response_parse"] = {
+            "has_content": not auxiliary,
+            "has_tool_calls": False,
+            "tool_call_parse_failed": False,
+        }
+        areal_cache["followup"] = interaction
+        return JSONResponse({"id": "followup"})
+
+    monkeypatch.setattr(
+        srv,
+        "_openai_client",
+        SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+            responses=SimpleNamespace(create=create),
+        ),
+    )
+    srv._session_cache["task"] = session
+    srv._api_key_to_session["task-key"] = "task"
+    headers = {"Authorization": "Bearer task-key"}
+    async with _client() as client:
+        response = await client.post(
+            endpoint, headers=headers, json={"model": "test", **payload}
+        )
+        assert response.status_code == 200
+        rewarded = await client.post(
+            "/rl/set_reward", headers=headers, json={"reward": 1.0}
+        )
+    assert rewarded.status_code == 200
+    exported = session.export_interactions(
+        discount=1.0, style="concat", episode_reward=1.0
+    )
+    assert set(exported) == ({"solve"} if auxiliary else {"solve", "followup"})
+    assert exported["solve" if auxiliary else "followup"].reward == 1.0
+
+
+@pytest.mark.asyncio
+async def test_chat_auxiliary_policy_ignores_responses_only_session_instructions(
+    monkeypatch,
+):
+    """Unsupported Responses defaults cannot hide an ordinary Chat training call."""
+    session = SessionData(
+        session_id="task",
+        metadata={
+            "auxiliary_system_prompts": ["Title"],
+            "generation_args": {"instructions": "Title"},
+        },
+    )
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+
+    async def create(messages, areal_cache, temperature=1.0, top_p=1.0):
+        return areal_cache
+
+    cache = await srv._call_client_create(
+        create, {"messages": [{"role": "user", "content": "Solve task"}]}, "task"
+    )
+    assert cache is session.completions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("default_prompt", ["Title", "Solve"])
+@pytest.mark.parametrize("request_prompt", ["Title", "Solve"])
+@pytest.mark.parametrize("use_input_system", [False, True])
+async def test_responses_http_ignores_chat_message_defaults(
+    monkeypatch, default_prompt, request_prompt, use_input_system
+):
+    """Only instructions consumed by Responses may select an auxiliary cache."""
+    from fastapi.responses import JSONResponse
+
+    session = SessionData(
+        session_id="task",
+        metadata={
+            "auxiliary_system_prompts": ["Title"],
+            "generation_args": {
+                "messages": [{"role": "system", "content": default_prompt}]
+            },
+        },
+    )
+    session.completions["previous"] = _prm_interaction("previous", [1], [2], [])
+    observed = []
+
+    async def create(input, areal_cache, instructions=None, temperature=1.0, top_p=1.0):
+        observed.append((input, instructions))
+        interaction = _prm_interaction("current", [3], [4], [])
+        interaction.reward = None
+        interaction.metadata["response_parse"] = {
+            "has_content": request_prompt != "Title",
+            "has_tool_calls": False,
+            "tool_call_parse_failed": False,
+        }
+        areal_cache["current"] = interaction
+        return JSONResponse({"id": "current"})
+
+    monkeypatch.setattr(
+        srv, "_openai_client", SimpleNamespace(responses=SimpleNamespace(create=create))
+    )
+    srv._session_cache["task"] = session
+    srv._api_key_to_session["task-key"] = "task"
+    headers = {"Authorization": "Bearer task-key"}
+    payload = (
+        {"input": [{"role": "system", "content": request_prompt}]}
+        if use_input_system
+        else {"instructions": request_prompt, "input": "task"}
+    )
+    async with _client() as client:
+        response = await client.post(
+            "/responses",
+            headers=headers,
+            json={"model": "test", **payload},
+        )
+        assert response.status_code == 200, response.text
+        rewarded = await client.post(
+            "/rl/set_reward", headers=headers, json={"reward": 1.0}
+        )
+    assert rewarded.status_code == 200
+    assert observed == [(payload["input"], payload.get("instructions"))]
+    exported = session.export_interactions(
+        discount=1.0, style="concat", episode_reward=1.0
+    )
+    auxiliary = request_prompt == "Title"
+    assert set(exported) == ({"previous"} if auxiliary else {"previous", "current"})
+    assert exported["previous" if auxiliary else "current"].reward == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allowlist", [[], ["Title"]])
+async def test_responses_http_lazy_validation_records_system_error(
+    monkeypatch, allowlist
+):
+    """Validation before classification must preserve JSON errors and task flags."""
+    session = SessionData(
+        session_id="task", metadata={"auxiliary_system_prompts": allowlist}
+    )
+    calls = []
+
+    async def create(input, areal_cache, **kwargs):
+        calls.append(input)
+
+    monkeypatch.setattr(
+        srv, "_openai_client", SimpleNamespace(responses=SimpleNamespace(create=create))
+    )
+    srv._session_cache["task"] = session
+    srv._api_key_to_session["task-key"] = "task"
+    transport = httpx.ASGITransport(app=srv.app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            "/responses",
+            headers={"Authorization": "Bearer task-key"},
+            json={
+                "model": "test",
+                "instructions": "Title",
+                "input": "task",
+                "tools": [{"type": "function", "parameters": {"type": "object"}}],
+            },
+        )
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert "detail" in response.json()
+    assert session.system_error
+    assert "ValidationError" in session.system_error_message
+    assert calls == []
+    assert len(session.completions) == 0
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_stream_does_not_register_training_completion_alias(
+    monkeypatch,
+):
+    """Concurrent streams may only alias interactions in the real training cache."""
+    from openai.types.chat import ChatCompletionChunk
+
+    session = SessionData(
+        session_id="task", metadata={"auxiliary_system_prompts": ["Title"]}
+    )
+
+    async def create(messages, areal_cache, **kwargs):
+        key = "title" if messages[0]["role"] == "system" else "solve"
+        areal_cache[key] = _prm_interaction(key, [1], [2], messages)
+
+        async def chunks():
+            yield ChatCompletionChunk(
+                id=key,
+                created=0,
+                model="test",
+                object="chat.completion.chunk",
+                choices=[
+                    {"index": 0, "delta": {"content": key}, "finish_reason": "stop"}
+                ],
+            )
+
+        return chunks()
+
+    monkeypatch.setattr(
+        srv,
+        "_openai_client",
+        SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    srv._session_cache["task"] = session
+    srv._api_key_to_session["task-key"] = "task"
+    async with _client() as client:
+        replies = await asyncio.gather(
+            *[
+                client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer task-key"},
+                    json={"model": "test", "messages": [message], "stream": True},
+                )
+                for message in [
+                    {"role": "user", "content": "Solve"},
+                    {"role": "system", "content": "Title"},
+                ]
+            ]
+        )
+    assert all(response.status_code == 200 for response in replies)
+    assert all("[DONE]" in response.text for response in replies)
+    assert set(session.completions) == {"solve"}
+    assert list(session.stream_completion_aliases.values()) == ["solve"]
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_invalid_tool_call_does_not_poison_task_session(monkeypatch):
+    session = SessionData(
+        session_id="task", metadata={"auxiliary_system_prompts": ["Title request"]}
+    )
+    monkeypatch.setattr(srv, "_openai_client", object())
+    monkeypatch.setattr(srv, "_session_cache", {"task": session})
+
+    async def create_fn(messages, **kwargs):
+        raise InvalidToolCallError("invalid title output")
+
+    with pytest.raises(InvalidToolCallError):
+        await srv._call_client_create(
+            create_fn,
+            {"messages": [{"role": "system", "content": "Title request"}]},
+            "task",
+        )
+    assert "task" not in srv._session_invalid_tool_errors
 
 
 @pytest.mark.asyncio
@@ -698,6 +1275,9 @@ class TestEndSessionInteractionCount:
         [
             ("local_context", True),
             ("backend_context", True),
+            ("backend_multimodal_context", True),
+            ("backend_multimodal_500", False),
+            ("backend_multimodal_other_400", False),
             ("backend_other_400", False),
             ("backend_500", False),
         ],
@@ -711,6 +1291,14 @@ class TestEndSessionInteractionCount:
             "207963 tokens from the input messages and 54189 tokens for the "
             "completion."
         )
+        if failure in ("backend_multimodal_context", "backend_multimodal_500"):
+            message = (
+                "Multimodal prompt is too long after expanding multimodal tokens. "
+                "After expanding len(req.origin_input_ids_unpadded)=131070 "
+                "=> 131070 >= 131066."
+            )
+        elif failure == "backend_multimodal_other_400":
+            message = "Multimodal image decoding failed"
 
         async def fail_create(*, areal_cache, **_kwargs):
             del areal_cache
@@ -726,7 +1314,9 @@ class TestEndSessionInteractionCount:
                     real_url="http://backend.invalid/generate"
                 ),
                 history=(),
-                status=500 if failure == "backend_500" else 400,
+                status=(
+                    500 if failure in ("backend_500", "backend_multimodal_500") else 400
+                ),
                 message="Bad Request. Response body: "
                 + json.dumps({"error": {"message": backend_message}}),
             )

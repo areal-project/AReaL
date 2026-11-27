@@ -13,7 +13,10 @@ def patch_tms_hook_mode() -> None:
     ``megatron.core.inference.contexts.dynamic_context`` assigns
     ``torch_memory_saver.hook_mode = "torch"`` at module import time. SGLang's
     pauseable CUDA graphs require the default ``preload`` hook, so drop that
-    assignment when graph saving is enabled. Also ignore unsafe attempts to
+    assignment when graph saving or WeftMoE is enabled. WeftMoE keeps graphs
+    resident, but its temporary expert allocations still need the preload
+    allocator: TMS 0.0.10 torch-mode teardown rejects frees outside a region.
+    Also ignore unsafe attempts to
     reconfigure the singleton after its implementation has been initialized.
 
     This must run from the SGLang entry module, before the scheduler imports
@@ -34,9 +37,11 @@ def patch_tms_hook_mode() -> None:
         return
 
     def safe_setter(self, value):
-        if value == "torch" and os.environ.get(
-            "SGLANG_MEMORY_SAVER_CUDA_GRAPH", ""
-        ).lower() in {"1", "true", "yes", "on"}:
+        if value == "torch" and (
+            os.environ.get("AREAL_USE_WEFTMOE") == "1"
+            or os.environ.get("SGLANG_MEMORY_SAVER_CUDA_GRAPH", "").lower()
+            in {"1", "true", "yes", "on"}
+        ):
             return
         if not hasattr(self, "_impl_ctor_kwargs"):
             return

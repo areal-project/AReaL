@@ -8,7 +8,9 @@ from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api.cli_args import ValidDatasetConfig, _DatasetConfig
+from areal.dataset.arena_stream import ArenaStreamDataset
 from areal.dataset.mopd import is_remote_dataset
+from areal.utils.arena_stream_dataloader import ArenaStreamDataLoader
 
 
 def create_dataloader(
@@ -17,7 +19,7 @@ def create_dataloader(
     world_size: int,
     dataset_config: _DatasetConfig,
     collate_fn: Callable | None = None,
-) -> StatefulDataLoader:
+) -> StatefulDataLoader | ArenaStreamDataLoader:
     """Create a stateful dataloader for a dataset with distributed sampler.
 
     Args:
@@ -38,6 +40,22 @@ def create_dataloader(
     if isinstance(dataset_config, ValidDatasetConfig):
         drop_sampler_last = False
 
+    arena_stream_dataset = None
+    if isinstance(dataset, ArenaStreamDataset):
+        if isinstance(dataset_config, ValidDatasetConfig):
+            dataset = dataset.dataset
+        else:
+            if world_size != 1 or rank != 0:
+                raise ValueError(
+                    "Arena stream replacement sampling requires a single rollout controller"
+                )
+            if collate_fn is not None:
+                raise ValueError(
+                    "Arena stream replacement sampling requires the default list collator"
+                )
+            arena_stream_dataset = dataset
+            dataset = dataset.streams
+
     remote_dataset = is_remote_dataset(dataset)
     if remote_dataset and isinstance(dataset_config, ValidDatasetConfig):
         sampler_cls = _PrefetchAwareEvalSampler
@@ -48,7 +66,7 @@ def create_dataloader(
     else:
         sampler_cls = DistributedSampler
 
-    return StatefulDataLoader(
+    dataloader = StatefulDataLoader(
         dataset,
         batch_size=dataset_config.batch_size // world_size,
         sampler=sampler_cls(
@@ -62,6 +80,11 @@ def create_dataloader(
         num_workers=dataset_config.num_workers,
         collate_fn=collate_fn or (lambda x: x),
     )
+    if arena_stream_dataset is not None:
+        return ArenaStreamDataLoader(
+            arena_stream_dataset, dataloader, shuffle=dataset_config.shuffle
+        )
+    return dataloader
 
 
 class EvalDistributedSampler(DistributedSampler):

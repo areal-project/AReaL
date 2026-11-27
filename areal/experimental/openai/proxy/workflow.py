@@ -309,6 +309,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         interaction_count: int,
         system_error: bool = False,
         invalid_tool_json: bool = False,
+        model_execution_timeout: bool = False,
     ) -> AgentFailureDisposition:
         """Classify whether an agent error is a trainable model failure.
 
@@ -338,6 +339,11 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             and "invalid_tool_json" in inspect.signature(classifier).parameters
         ):
             classifier_kwargs["invalid_tool_json"] = True
+        if (
+            model_execution_timeout
+            and "model_execution_timeout" in inspect.signature(classifier).parameters
+        ):
+            classifier_kwargs["model_execution_timeout"] = True
         disposition = classifier(error, **classifier_kwargs)
         valid_dispositions = {
             "model_failure_zero",
@@ -596,6 +602,9 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                     raise ValueError(f"Invalid reward type: {type(rewards)}")
 
         invalid_tool_json = bool(getattr(proxy_client, "invalid_tool_json", False))
+        model_execution_timeout = bool(
+            getattr(proxy_client, "model_execution_timeout", False)
+        )
         if (
             agent_error is None
             and (proxy_client.context_overflow or invalid_tool_json)
@@ -612,6 +621,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 interaction_count=proxy_client.interaction_count,
                 system_error=proxy_client.system_error,
                 invalid_tool_json=invalid_tool_json,
+                model_execution_timeout=model_execution_timeout,
             )
             await self._call_agent_hook(
                 "record_failure_disposition",
@@ -665,9 +675,11 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         if recover_model_failure:
             logger.warning(
                 "Recovering model failure with reward 0: context_overflow=%s, "
-                "invalid_tool_json=%s, interactions=%d, agent_error=%s",
+                "invalid_tool_json=%s, model_execution_timeout=%s, "
+                "interactions=%d, agent_error=%s",
                 proxy_client.context_overflow,
                 invalid_tool_json,
+                model_execution_timeout,
                 proxy_client.interaction_count,
                 agent_error,
             )
@@ -715,6 +727,14 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             )
             if episode_reward is not None:
                 export_kwargs["episode_reward"] = episode_reward
+                policy = await self._call_agent_hook(
+                    "get_response_validation_policy_for_export",
+                    data,
+                    rewards,
+                    export_style=self.export_style,
+                )
+                if policy is not None and policy != "final_response":
+                    export_kwargs["response_validation_policy"] = policy
 
         # Apply turn-level discount and export interactions
         interactions = await proxy_client.export_interactions(

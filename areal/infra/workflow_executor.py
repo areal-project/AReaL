@@ -30,9 +30,16 @@ from .async_task_runner import (
     TimedResult,
 )
 from .staleness_manager import StalenessManager
-from areal.utils.rollout_metrics import ConsumedMetrics, Metrics, capture_metrics
+from areal.utils.rollout_metrics import (
+    ConsumedMetrics,
+    Metrics,
+    capture_metrics,
+    get_arena_stream_name,
+)
 from areal.infra import workflow_context
 from .workflow_context import WorkflowContext
+from areal.v2.inference_service.router.client import backend_session
+from areal.v2.inference_service.router.backend import RoutingError
 from areal.experimental.openai.types import (
     InteractionWithTokenLogpReward,
     concat_string_interactions,
@@ -80,7 +87,7 @@ def check_trajectory_format(
     Special handling is provided for:
 
     - **multi_modal_input**: Expected to be a non-empty list of dictionaries
-      containing ``pixel_values``
+      containing ``pixel_values`` or ``pixel_values_videos``
     - **Non-tensor data**: Logged for informational purposes
 
     Parameters
@@ -213,10 +220,12 @@ def check_trajectory_format(
                 raise ValueError(
                     "multi_modal_input should be a non-empty list of dicts"
                 )
-            if not all("pixel_values" in v for v in value):
+            if not all(
+                "pixel_values" in v or "pixel_values_videos" in v for v in value
+            ):
                 raise ValueError(
                     "multi_modal_input should at least contain the "
-                    "`pixel_values` field."
+                    "`pixel_values` or `pixel_values_videos` field."
                 )
         else:
             logger.info(f"Encounter non-tensor data with key `{key}`: {value}")
@@ -358,6 +367,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         terminal_error_fn: Callable[[TResult], Exception | None] | None = None,
         deterministic_order: bool = False,
         consume_result: Callable[[TResult | None], TResult | None] | None = None,
+        health_check: Callable[[], None] | None = None,
     ):
         self.runner = AsyncTaskRunner(
             max_queue_size=max_queue_size,
@@ -369,6 +379,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self.enable_tracing = enable_tracing
         self.terminal_error_fn = terminal_error_fn
         self.deterministic_order = deterministic_order
+        self.health_check = health_check
         self.logger: Logger
 
         # Unbounded deques for producer/consumer pattern
@@ -417,11 +428,13 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
     def register_callback(self, task_id: int, callback_addr: str):
         """Register a callback address for a task."""
-        self._task_callbacks[task_id] = callback_addr
+        with self._result_cv:
+            self._task_callbacks[task_id] = callback_addr
 
     def cancel_callback(self, task_id: int):
         """Remove a registered callback for a task (e.g., on timeout)."""
-        self._task_callbacks.pop(task_id, None)
+        with self._result_cv:
+            self._task_callbacks.pop(task_id, None)
 
     def _send_callback(self, addr: str, task_id: int, result: TResult):
         """Send task result to callback address (fire-and-forget)."""
@@ -498,7 +511,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     for result in results:
                         self._pending_results[result.task_id] = result
                         # Trigger callback if registered
-                        cb_addr = self._task_callbacks.pop(result.task_id, None)
+                        cb_addr = self._task_callbacks.get(result.task_id)
                         if cb_addr:
                             self._send_callback(cb_addr, result.task_id, result.data)
                     self._result_cv.notify_all()
@@ -608,7 +621,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             f"rejected: {stats.rejected}."
         )
 
-    def submit_task_input(self, task_input: TInput) -> None:
+    def submit_task_input(
+        self, task_input: TInput, *, callback_addr: str | None = None
+    ) -> None:
         """Submit a task input for processing.
 
         Parameters
@@ -617,14 +632,22 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             Task input to be processed.
         """
         self._check_thread_exception()
-        with self._input_cv:
+        task_id = task_input.task_id
+        with self._input_cv, self._result_cv:
+            if task_id in self._active_task_ids:
+                # A controller can retry a submit whose acknowledgement was lost.
+                # Its task ID and callback identify the same outstanding request.
+                if callback_addr and self._task_callbacks.get(task_id) == callback_addr:
+                    return
+                raise ValueError(f"Duplicate task_id: {task_id}")
+            self._active_task_ids.add(task_id)
+            if callback_addr:
+                self._task_callbacks[task_id] = callback_addr
             self._pending_inputs.append(task_input)
             self.staleness_manager.on_rollout_enqueued()
             if self.enable_tracing:
                 self.logger.info(f"Enqueue rollout. {self._rollout_stats()}")
             self._input_cv.notify()
-        with self._result_cv:
-            self._active_task_ids.add(task_input.task_id)
 
     def wait_results(
         self, count: int, timeout: float | None = None, raise_timeout: bool = True
@@ -656,6 +679,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         with self._result_cv:
             while True:
                 terminal_error = self._pop_terminal_error_locked()
+                if self.health_check is not None:
+                    self.health_check()
                 if terminal_error is not None:
                     raise terminal_error
                 if len(self._pending_results) >= count:
@@ -672,7 +697,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                         )
                     return []
 
-                self._result_cv.wait(timeout=remaining)
+                self._result_cv.wait(
+                    timeout=min(remaining, 1.0) if self.health_check else remaining
+                )
 
             drained: list[TimedResult[TResult]] = list(self._pending_results.values())
             self._pending_results.clear()
@@ -689,6 +716,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 self._result_cv.notify_all()
             for r in selected:
                 self._active_task_ids.discard(r.task_id)
+                self._task_callbacks.pop(r.task_id, None)
 
         return [self.consume_result(r.data) for r in selected]
 
@@ -715,6 +743,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     terminal_error = self._pop_terminal_error_locked(task_id)
                     if terminal_error is not None:
                         raise terminal_error
+                if self.health_check is not None:
+                    self.health_check()
                 if task_id in self._pending_results:
                     break
                 self._check_thread_exception()
@@ -726,10 +756,13 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                         raise TimeoutError(f"Timed out waiting for task {task_id}.")
                     return None
 
-                self._result_cv.wait(timeout=remaining)
+                self._result_cv.wait(
+                    timeout=min(remaining, 1.0) if self.health_check else remaining
+                )
 
             found_result = self._pending_results.pop(task_id)
             self._active_task_ids.remove(task_id)
+            self._task_callbacks.pop(task_id, None)
             self._result_cv.notify_all()
             result = found_result.data
         return self.consume_result(result) if consume else result
@@ -751,6 +784,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 continue
             self._pending_results.pop(pending_task_id)
             self._active_task_ids.discard(pending_task_id)
+            self._task_callbacks.pop(pending_task_id, None)
             self._result_cv.notify_all()
             return error
         return None
@@ -1327,6 +1361,26 @@ class WorkflowExecutor:
             filtering/validation.
         """
 
+        arena_stream_name = get_arena_stream_name(pending_task.data)
+
+        def record_arena_stream_disposition(
+            accepted: bool, *, filter_rejected: bool = False
+        ) -> None:
+            """Record global and per-Arena-stream acceptance and filtering."""
+            metrics = dict(
+                accepted=int(accepted),
+                rejected=int(not accepted),
+                filter_rejected=int(filter_rejected),
+            )
+            if arena_stream_name:
+                metrics.update(
+                    {
+                        f"stream/{arena_stream_name}/{key}": value
+                        for key, value in metrics.items()
+                    }
+                )
+            stats_tracker.get(workflow_context.stat_scope()).scalar(**metrics)
+
         async def _execute_workflow() -> WorkflowTaskResult | None:
             """Execute workflow.arun_episode and apply AReaL-specific logic."""
             task_id = pending_task.task_id
@@ -1349,9 +1403,10 @@ class WorkflowExecutor:
             try:
                 workflow_data = pending_task.data
                 if workflow_data is not None:
-                    traj = await pending_task.workflow.arun_episode(
-                        self.inference_engine, workflow_data
-                    )
+                    async with backend_session(self.inference_engine):
+                        traj = await pending_task.workflow.arun_episode(
+                            self.inference_engine, workflow_data
+                        )
 
                 # Trajectory format checking
                 if self.config.check_trajectory_format and traj is not None:
@@ -1410,6 +1465,8 @@ class WorkflowExecutor:
                         if not isinstance(group, RolloutGroup):
                             raise ValueError("rollout_group must be a RolloutGroup")
                         group = group.validate_rows(rows)
+                        if arena_stream_name:
+                            group = replace(group, arena_stream_name=arena_stream_name)
                         traj = {k: v for k, v in traj.items() if k != "rollout_reward"}
                         traj["rollout_group"] = group
                     except (TypeError, ValueError) as exc:
@@ -1442,9 +1499,7 @@ class WorkflowExecutor:
 
                 if should_accept_traj:
                     manager.on_rollout_accepted()
-                    stats_tracker.get(workflow_context.stat_scope()).scalar(
-                        accepted=1, rejected=0
-                    )
+                    record_arena_stream_disposition(True)
                     trace_session_event(
                         "mark_finalized",
                         task_id=task_id,
@@ -1458,8 +1513,8 @@ class WorkflowExecutor:
                     return _RolloutResult(task_id=task_id, trajectory=traj)
 
                 manager.on_rollout_rejected()
-                stats_tracker.get(workflow_context.stat_scope()).scalar(
-                    accepted=0, rejected=1
+                record_arena_stream_disposition(
+                    False, filter_rejected=reason == "rejected"
                 )
                 trace_session_event(
                     "mark_finalized",
@@ -1474,9 +1529,9 @@ class WorkflowExecutor:
                 await self._clear_rejected_trajectory(traj)
                 return None
 
-            except WorkflowContractError as exc:
+            except (WorkflowContractError, RoutingError) as exc:
                 manager.on_rollout_rejected()
-                stats_tracker.get("rollout").scalar(rejected=1)
+                record_arena_stream_disposition(False)
                 trace_session_event(
                     "mark_finalized",
                     task_id=task_id,
@@ -1490,9 +1545,7 @@ class WorkflowExecutor:
                 return WorkflowContractFailure(message=str(exc))
             except Exception as exc:  # pragma: no cover - workflow execution errors
                 manager.on_rollout_rejected()
-                stats_tracker.get(workflow_context.stat_scope()).scalar(
-                    accepted=0, rejected=1
-                )
+                record_arena_stream_disposition(False)
                 trace_session_event(
                     "mark_finalized",
                     task_id=task_id,
@@ -1524,6 +1577,7 @@ class WorkflowExecutor:
         should_accept_fn: Callable[[dict[str, Any]], bool] = None,
         task_id: int | None = None,
         is_eval: bool = False,
+        callback_addr: str | None = None,
     ) -> int:
         """Submit a rollout request to the workflow executor.
 
@@ -1544,7 +1598,7 @@ class WorkflowExecutor:
         )
 
         # Delegate to dispatcher
-        self.dispatcher.submit_task_input(task_input)
+        self.dispatcher.submit_task_input(task_input, callback_addr=callback_addr)
         return task_id
 
     def wait(

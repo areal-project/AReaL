@@ -924,6 +924,30 @@ class FP8EngineConfig:
         },
     )
 
+    def apply_to(self, transformer_config: Any) -> None:
+        """Apply the same precision settings to MCore and Bridge providers."""
+        unprefixed = {
+            "tp_only_amax_red",
+            "first_last_layers_bf16",
+            "num_layers_at_start_in_bf16",
+            "num_layers_at_end_in_bf16",
+        }
+        for option in fields(self):
+            if option.name == "direct_convert":
+                # AReaL's export policy, not a TransformerEngine option.
+                continue
+            target = (
+                "fp8"
+                if option.name == "mode"
+                else option.name
+                if option.name in unprefixed
+                else f"fp8_{option.name}"
+            )
+            if hasattr(transformer_config, target):
+                setattr(transformer_config, target, getattr(self, option.name))
+            else:
+                logger.warning("Unknown FP8 field in TransformerConfig: %s", target)
+
 
 @dataclass
 class CPUStagedOffloadConfig:
@@ -1426,6 +1450,17 @@ class SchedulingSpec:
         default=None,
         metadata={
             "help": "Command to execute inside the container. Defaults to AReaL's RPC server."
+        },
+    )
+    ray_runtime_env: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Native Ray runtime environment for this role's launchers. "
+            "Use image_uri or container.image for OCI images; container.run_options "
+            "supplies Podman GPU and volume options. All specs in a role must "
+            "use the same runtime environment and resources. Explicit env_vars "
+            "override runtime_env.env_vars. Images must contain compatible Ray "
+            "and Python versions and make AReaL importable."
         },
     )
     # Slurm specific options
@@ -2239,7 +2274,7 @@ class PPOActorConfig(TrainEngineConfig):
     use_score_centering: bool = field(
         default=False,
         metadata={
-            "help": "Use REINFORCE with head/tail score centering instead of clipped PPO. Initial support: SGLang, FSDP (TP/CP), temperature=1, no sampling truncation."
+            "help": "Use REINFORCE with head/tail score centering instead of clipped PPO. Support: SGLang, FSDP (TP/CP) or Megatron (TP/CP/PP), temperature=1, no sampling truncation."
         },
     )
 
@@ -2452,11 +2487,21 @@ class PPOActorConfig(TrainEngineConfig):
         super().__post_init__()
         if self.use_score_centering:
             if (
-                not self.backend.startswith("fsdp:")
+                not self.backend.startswith(("fsdp:", "megatron:"))
                 or self.enable_tree_training
                 or self.is_critic
             ):
-                raise ValueError("Score centering requires an ordinary FSDP actor.")
+                raise ValueError(
+                    "Score centering requires an ordinary FSDP or Megatron actor."
+                )
+            if self.backend.startswith("megatron:") and (
+                self.megatron.lm_head_loss_chunk_size > 0
+                or self.megatron.enable_mtp_training
+                or self.megatron.entropy_requires_grad
+            ):
+                raise ValueError(
+                    "Megatron score centering requires ordinary logits, no MTP, and diagnostic-only entropy."
+                )
             if self.temperature != 1.0 or self.recompute_logprob:
                 raise ValueError(
                     "Score centering requires temperature=1 and recompute_logprob=False to preserve sampler probabilities."
@@ -2671,6 +2716,12 @@ class SGLangConfig:
     cuda_graph_max_bs: int | None = None
     cuda_graph_bs: list[int] | None = None
     torchao_config: str = ""
+    fp8_gemm_runner_backend: str | None = field(
+        default=None,
+        metadata={
+            "help": "SGLang FP8 GEMM backend. Qwen3.5 AWEX block-FP8 supports 'triton' or 'deep_gemm'; packed DeepGEMM scales are rebuilt after each weight update."
+        },
+    )
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -2681,8 +2732,31 @@ class SGLangConfig:
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
     mm_attention_backend: str | None = None
+    linear_attn_decode_backend: str | None = field(
+        default=None,
+        kw_only=True,
+        metadata={
+            "help": "Linear attention kernel backend for decode. None lets SGLang select the backend."
+        },
+    )
+    linear_attn_prefill_backend: str | None = field(
+        default=None,
+        kw_only=True,
+        metadata={
+            "help": "Linear attention kernel backend for prefill. None lets SGLang select the backend."
+        },
+    )
     enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
+    mm_process_config: dict[str, Any] | None = field(
+        default=None,
+        kw_only=True,
+        metadata={
+            "help": "SGLang multimodal preprocessing options keyed by modality "
+            "(image, video, or audio), such as min_pixels and max_pixels for "
+            "images. None uses SGLang defaults."
+        },
+    )
     limit_mm_data_per_request: dict[str, int] | None = field(
         default=None,
         metadata={
@@ -2808,6 +2882,11 @@ class SGLangConfig:
 
     @staticmethod
     def build_cmd_from_args(args: dict[str, Any]):
+        args = dict(args)
+        # SGLang's CLI spelling differs from its ServerArgs field name.
+        backend = args.pop("fp8_gemm_runner_backend", None)
+        if backend is not None:
+            args["fp8_gemm_backend"] = backend
         return get_py_cmd("areal.v2.inference_service.sglang.launch_server", args)
 
     @staticmethod
@@ -2837,12 +2916,19 @@ class SGLangConfig:
             )
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
+        if sglang_config.fp8_gemm_runner_backend is None:
+            args.pop("fp8_gemm_runner_backend")
         # build_args also accepts DictConfig, which bypasses __post_init__.
         limits = args.get("limit_mm_data_per_request")
         SGLangConfig._validate_mm_limits(limits)
         if limits is not None:
             args["limit_mm_data_per_request"] = json.dumps(
                 limits, separators=(",", ":")
+            )
+        mm_process_config = args.get("mm_process_config")
+        if mm_process_config is not None:
+            args["mm_process_config"] = json.dumps(
+                mm_process_config, separators=(",", ":")
             )
         if sglang_config.enable_multithread_load:
             model_loader_extra_config = dict(
@@ -3188,6 +3274,48 @@ class AgentConfig:
 
 
 @dataclass
+class BackendRoutingConfig:
+    """Optional v1 trajectory routing through the shared v2 Router service.
+
+    Set `rollout.backend_routing.enabled: true` with SGLang in single-controller
+    mode. The controller starts a router automatically unless `router_addr` and
+    its `admin_api_key` are supplied through private configuration.
+
+    New sessions choose a healthy backend with the fewest outstanding execution
+    leases divided by capacity; ties are random. Subsequent requests retain the
+    same backend for cache locality. This score counts in-flight requests, not
+    tokens, active trajectories, or GPU utilization. Capacity normalizes the
+    score without changing native concurrency. Generation goes directly to the
+    backend; the router only handles metadata.
+
+    Pausing fences admission and drains executions before native generation is
+    paused for weight publication. An ambiguous execution fails the pool and
+    requires restarting the experiment; it is never automatically replayed.
+    """
+
+    enabled: bool = False
+    """Route each generation execution; retain existing routing when false."""
+    router_addr: str | None = None
+    """Reachable existing Router URL; None starts one on the Controller node."""
+    admin_api_key: str | None = None
+    """Existing Router credential; generated per run for an owned subprocess."""
+    capacity: int | None = None
+    """Positive normalization capacity; defaults to SGLang max_running_requests."""
+    metadata_timeout: float = 30.0
+    """Maximum seconds to resolve a metadata operation with idempotent retries."""
+    control_timeout: float = 1800.0
+    """Maximum seconds of backend unavailability or draining; excludes training pauses."""
+
+    def __post_init__(self):
+        if self.capacity is not None and self.capacity <= 0:
+            raise ValueError("backend_routing.capacity must be positive")
+        if self.metadata_timeout <= 0 or self.control_timeout <= 0:
+            raise ValueError("backend routing timeouts must be positive")
+        if self.router_addr and not self.admin_api_key:
+            raise ValueError("An existing backend Router requires admin_api_key")
+
+
+@dataclass
 class InferenceEngineConfig:
     """Configuration for inference servers, including offpolicyness control."""
 
@@ -3361,6 +3489,8 @@ class InferenceEngineConfig:
         default="round_robin",
         metadata={"help": "Routing strategy for the inference-service router."},
     )
+    backend_routing: BackendRoutingConfig = field(default_factory=BackendRoutingConfig)
+    """v1 direct generation routing; independent of DataProxy owner routing."""
     poll_interval: float = field(
         default=5.0,
         metadata={

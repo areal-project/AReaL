@@ -7,12 +7,18 @@ import hashlib
 import hmac
 import threading
 import time
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
 from areal.experimental.openai.cache import InteractionCache
-from areal.experimental.openai.finalization import finalize_interactions
+from areal.experimental.openai.finalization import (
+    ResponseValidationPolicy,
+    finalize_interactions,
+    response_validator_for_policy,
+)
+from areal.utils.errors import ModelExecutionTimeoutError
 
 if TYPE_CHECKING:
     from areal.experimental.openai.types import InteractionWithTokenLogpReward
@@ -109,6 +115,7 @@ class ExportTrajectoriesRequest(BaseModel):
     is_eval: bool = False
     # Explicit agent opt-in; applied before serialization when PRM is disabled.
     episode_reward: float | None = Field(default=None, allow_inf_nan=False)
+    response_validation_policy: ResponseValidationPolicy = "final_response"
 
 
 class ExportTrajectoriesResponse(BaseModel):
@@ -136,6 +143,9 @@ class SessionData:
         metadata: dict[str, Any] | None = None,
     ):
         self.session_id = session_id
+        # Public task/session names may be reused after export. Backend CLOSED
+        # tombstones are run-long, so each physical trajectory needs a nonce.
+        self.backend_session_id = uuid.uuid4().hex
         self.sampling_seed_identity = sampling_seed_identity or session_id
         self.processor_cache = processor_cache
         self.processor_cache_group_id = processor_cache_group_id
@@ -156,6 +166,10 @@ class SessionData:
         self.context_overflow_message = ""
         self.system_error = False
         self.system_error_message = ""
+        self.model_execution_timeout = False
+        self._active_model_requests = 0
+        self._concurrent_model_requests = False
+        self._cancelled_model_request = False
         self._next_sampling_request_index = 0
         self._processor_cache_released = False
 
@@ -209,6 +223,39 @@ class SessionData:
             if not self.system_error_message:
                 self.system_error_message = message
 
+    def begin_model_request(self) -> None:
+        """Fence retries after a confirmed model timeout and track ambiguity."""
+        with self._lock:
+            if self.model_execution_timeout:
+                raise ModelExecutionTimeoutError()
+            if self._active_model_requests:
+                self._concurrent_model_requests = True
+            self._active_model_requests += 1
+
+    def end_model_request(self) -> None:
+        with self._lock:
+            self._active_model_requests -= 1
+
+    def mark_model_execution_timeout(self) -> None:
+        with self._lock:
+            self.model_execution_timeout = True
+
+    def mark_model_request_cancelled(self) -> None:
+        """Cancellation does not prove a dispatched backend request terminated."""
+        with self._lock:
+            self._cancelled_model_request = True
+
+    @property
+    def recoverable_model_execution_timeout(self) -> bool:
+        """Concurrent or cancelled requests leave the terminal cause ambiguous."""
+        with self._lock:
+            return (
+                self.model_execution_timeout
+                and not self._concurrent_model_requests
+                and not self._cancelled_model_request
+                and self._active_model_requests == 0
+            )
+
     @property
     def is_completed(self) -> bool:
         """Whether this session has been completed via ``finish()``."""
@@ -236,7 +283,13 @@ class SessionData:
         drop_retry_orphans: bool = False,
         *,
         episode_reward: float | None = None,
+        response_validation_policy: ResponseValidationPolicy = "final_response",
     ) -> dict[str, InteractionWithTokenLogpReward]:
+        if response_validation_policy == "artifact_reward" and (
+            episode_reward is None or style != "concat"
+        ):
+            raise ValueError("Artifact reward policy requires a concat episode reward")
+        response_validator = response_validator_for_policy(response_validation_policy)
         if len(self.completions) == 0:
             return {}
         interactions = finalize_interactions(
@@ -244,6 +297,7 @@ class SessionData:
             style=style,
             reward_discount=discount,
             episode_reward=episode_reward,
+            response_validator=response_validator,
             drop_retry_orphans=drop_retry_orphans,
         )
         for interaction in interactions.values():

@@ -230,17 +230,18 @@ def test_parse_arena_stream_config_rejects_metric_unsafe_name():
         parse_arena_stream_config({"name": "bad/name", "stream_id": "stream-a"})
 
 
-def test_load_arena_stream_configs_rejects_duplicate_stream_ids():
-    """A copied Stream id must not silently receive multiple mixture weights."""
-    with pytest.raises(ValueError, match="ids must be unique"):
-        load_arena_stream_configs(
-            {
-                "arena_streams": [
-                    {"name": "a", "stream_id": "stream-a"},
-                    {"name": "b", "stream_id": "stream-a"},
-                ]
-            }
-        )
+def test_load_arena_stream_configs_allows_duplicate_ids_for_logical_harnesses():
+    """One real Stream can have separate logical Harness metric namespaces."""
+    streams = load_arena_stream_configs(
+        {
+            "arena_streams": [
+                {"name": "a", "stream_id": "stream-a"},
+                {"name": "b", "stream_id": "stream-a"},
+            ]
+        }
+    )
+    assert [stream.name for stream in streams] == ["a", "b"]
+    assert [stream.stream_id for stream in streams] == ["stream-a", "stream-a"]
 
 
 def test_build_weighted_arena_rows_uses_attempted_group_weights():
@@ -576,8 +577,13 @@ def test_preflight_health_ignores_tasks_without_exact_provenance():
     assert (terminal, failures) == (1, 1)
 
 
-def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path):
+@pytest.mark.parametrize("shared_stream", [False, True])
+@pytest.mark.parametrize("with_observation", [False, True])
+def test_workflow_routes_harness_transform_and_raw_metrics(
+    monkeypatch, tmp_path, with_observation, shared_stream
+):
     """A row should select all rollout and reward settings from its Stream."""
+    second_stream_id = "stream-a" if shared_stream else "stream-b"
     stats_tracker.export_all(reset=True)
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "llm-key")
@@ -601,7 +607,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
                 },
                 {
                     "name": "b",
-                    "stream_id": "stream-b",
+                    "stream_id": second_stream_id,
                     "harness": "codex@2",
                     "task_envs": {"MODE": "b"},
                     "expected_reward_ref": {"key": "reward-b", "version": "2"},
@@ -611,6 +617,28 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
         }
     )
     launched = {}
+    display_name = "总项｜可见几何质量（占总分10%）"
+    sub_scores = {display_name if with_observation else "quality": 0.25}
+    raw = {"exit_code": 0, "reward_txt": "ok"}
+    if with_observation:
+        raw.update(
+            {
+                "reward_display": {"component_ids": {display_name: "quality"}},
+                "reward_observation": {
+                    "schema_version": 1,
+                    "verifier_version": "test-v1",
+                    "components": {
+                        "quality": {
+                            "value": 0.25,
+                            "weight": 0.8,
+                            "contribution": 0.2,
+                            "share": 0.4,
+                        }
+                    },
+                    "diagnostics": {"output_length": 1234},
+                },
+            }
+        )
 
     async def resolve_stream(stream_id, **_kwargs):
         return {
@@ -634,8 +662,8 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
             task_id="task-b",
             status="DONE",
             score=0.5,
-            sub_scores={"quality": 0.25},
-            raw={"exit_code": 0, "reward_txt": "ok"},
+            sub_scores=sub_scores,
+            raw=raw,
             trace_id="trace-b",
         )
 
@@ -647,7 +675,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
     monkeypatch.setattr(workflow.client, "delete_llm_proxy_async", delete)
     data = {
         "arena_stream_name": "b",
-        "stream_id": "stream-b",
+        "stream_id": second_stream_id,
         "data_id": "data-b",
         "reward_ref_key": "reward-b",
         "reward_ref_version": "2",
@@ -669,7 +697,7 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
     reward = asyncio.run(run_workflow())
 
     assert reward == pytest.approx(0.75)
-    assert launched["stream_id"] == "stream-b"
+    assert launched["stream_id"] == second_stream_id
     assert launched["harness"] == "codex@2"
     assert launched["task_envs"] == {"MODE": "b"}
     stats = stats_tracker.export_all(reset=True)
@@ -677,13 +705,40 @@ def test_workflow_routes_harness_transform_and_raw_metrics(monkeypatch, tmp_path
     assert stats["rollout/training_score"] == pytest.approx(0.75)
     assert stats["rollout/arena_raw_present"] == 1.0
     assert stats["rollout/stream/b/arena_score"] == pytest.approx(0.5)
-    assert stats["rollout/reward_sub_score/quality"] == pytest.approx(0.25)
-    assert stats["rollout/stream/b/reward_sub_score/quality"] == pytest.approx(0.25)
+    prefix = "rollout/stream/b"
+    assert stats[f"{prefix}/reward_sub_score/quality"] == pytest.approx(0.25)
+    assert stats[f"{prefix}/reward_sub_score/invalid_entries"] == 0.0
+    assert stats[f"{prefix}/reward_observation/present"] == float(with_observation)
+    assert stats[f"{prefix}/reward_breakdown/present"] == 0.0
+    assert stats[f"{prefix}/reward_breakdown/valid"] == 0.0
+    assert not any(
+        key.startswith(
+            (
+                "rollout/reward_sub_score/",
+                "rollout/reward_observation/",
+                "rollout/reward_breakdown/",
+                "rollout/stream/a/reward_",
+            )
+        )
+        for key in stats
+    )
+    if with_observation:
+        assert stats[f"{prefix}/reward_observation/valid"] == 1.0
+        for field, expected in (
+            ("value", 0.25),
+            ("weight", 0.8),
+            ("contribution", 0.2),
+            ("share", 0.4),
+        ):
+            assert stats[
+                f"{prefix}/reward_observation/components/quality/{field}"
+            ] == pytest.approx(expected)
+        assert stats[f"{prefix}/reward_observation/diagnostics/output_length"] == 1234.0
     dump_files = list((tmp_path / "arena-results").glob("arena_results_*.jsonl"))
     assert len(dump_files) == 1
     dump_record = json.loads(dump_files[0].read_text(encoding="utf-8"))
-    assert dump_record["raw"] == {"exit_code": 0, "reward_txt": "ok"}
-    assert dump_record["sub_scores"] == {"quality": 0.25}
+    assert dump_record["raw"] == raw
+    assert dump_record["sub_scores"] == sub_scores
     assert dump_record["expected_reward_ref"] == {
         "key": "reward-b",
         "version": "2",
@@ -958,6 +1013,122 @@ def test_core_model_failure_with_matching_native_receipt_keeps_zero(
 
 
 @pytest.mark.parametrize(
+    "code,reason,message",
+    [
+        (
+            "LLM_RESPONSE_FAILED",
+            "empty_completion",
+            "model stopped without visible output or tool calls",
+        ),
+        (
+            "LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED",
+            "provider_length_stop",
+            "model stopped with reason: length",
+        ),
+    ],
+)
+def test_core_single_turn_observation_policy_preserves_model_zero(
+    code, reason, message
+):
+    """Policy metadata from an observational runner is not a delivery result."""
+    error = _core_model_failure_error(code, reason, message)
+    error.harness_result["continuations"] = 0
+    error.harness_result["delivery"] = {
+        "policy": "observation_only",
+        "independent_blender_reopen": False,
+    }
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=0
+        )
+        == "unknown_failure_reject"
+    )
+    if reason == "empty_completion":
+        assert (
+            ArenaStreamAgentWorkflow._harness_failure_reason(error)
+            == "empty_completion"
+        )
+
+
+@pytest.mark.parametrize(
+    "delivery",
+    [
+        {"policy": "observation_only", "independent_blender_reopen": True},
+        {"policy": "observation_only", "independent_blender_reopen": "false"},
+        {"policy": "observation_only", "independent_blender_reopen": 0},
+        {"policy": "observation_only"},
+        {"policy": "required", "independent_blender_reopen": False},
+        {
+            "policy": "observation_only",
+            "independent_blender_reopen": False,
+            "status": "incomplete",
+        },
+        {
+            "policy": "observation_only",
+            "independent_blender_reopen": False,
+            "status": "ERROR",
+        },
+    ],
+)
+def test_core_single_turn_policy_rejects_execution_results_and_unknown_shapes(
+    delivery,
+):
+    """A policy label cannot hide delivery work or loosely typed metadata."""
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED",
+        "empty_completion",
+        "model stopped without visible output or tool calls",
+    )
+    error.harness_result["delivery"] = delivery
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure_field,value",
+    [
+        ("failure", {"code": "collection_failed"}),
+        ("observed_runner_timeout", True),
+        ("observed_external_interruption", True),
+        ("collection", {"status": "ERROR"}),
+    ],
+)
+def test_core_observation_policy_does_not_hide_runner_or_collection_failure(
+    failure_field, value
+):
+    """Even a matching model error is unscored when its runner is unhealthy."""
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED",
+        "empty_completion",
+        "model stopped without visible output or tool calls",
+    )
+    error.harness_result["delivery"] = {
+        "policy": "observation_only",
+        "independent_blender_reopen": False,
+    }
+    error.harness_result[failure_field] = value
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
     "mutation",
     [
         "missing_receipt",
@@ -1034,6 +1205,107 @@ def _core_context_failure_error() -> ArenaTaskFailedError:
     return error
 
 
+def _core_tool_budget_failure_error(continuations=0) -> ArenaTaskFailedError:
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED",
+        "empty_completion",
+        "tool_call_budget_exceeded: argument_bytes (limit 65536, observed 94917)",
+    )
+    outcome = {
+        "code": "LLM_RESPONSE_FAILED",
+        "class": "agent",
+        "source": "core_tool_decoder",
+        "details": {
+            "code": "tool_call_budget_exceeded",
+            "budget": "argument_bytes",
+            "limit": 65536,
+            "observed": 94917,
+        },
+    }
+    summary = "GAMEAGENT_OUTCOME_CODE=LLM_RESPONSE_FAILED GAMEAGENT_OUTCOME_CLASS=agent"
+    raw = dict(error.result.raw)
+    raw["outcome"] = outcome
+    raw["harness"] = {**raw["harness"], "summary": summary}
+    error.result = replace(error.result, raw=raw)
+    receipt = error.harness_result
+    receipt["summary"] = summary
+    receipt["turn_statuses"] = ["completed"] * continuations + ["failed"]
+    receipt["error"] = [None] * continuations + [
+        {
+            "message": "tool_call_budget_exceeded: argument_bytes (limit 65536, observed 94917)",
+            "outcome": deepcopy(outcome),
+        }
+    ]
+    receipt["continuations"] = continuations
+    receipt["delivery"] = None
+    receipt["raw"] = {"outcome": deepcopy(outcome)}
+    return error
+
+
+@pytest.mark.parametrize("continuations", [0, 1, 2])
+def test_core_tool_budget_failure_with_matching_receipt_keeps_zero(continuations):
+    error = _core_tool_budget_failure_error(continuations)
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "model_failure_zero"
+    )
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=0
+        )
+        == "unknown_failure_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "receipt_message",
+        "receipt_error_outcome",
+        "receipt_raw_outcome",
+        "summary",
+        "source",
+        "boolean_limit",
+        "limit_not_exceeded",
+        "unexpected_detail",
+        "continuations",
+        "turn_statuses",
+    ],
+)
+def test_core_tool_budget_failure_rejects_mismatched_evidence(mutation):
+    error = _core_tool_budget_failure_error(continuations=1)
+    if mutation == "receipt_message":
+        error.harness_result["error"][-1]["message"] = "model service unavailable"
+    elif mutation == "receipt_error_outcome":
+        error.harness_result["error"][-1]["outcome"]["source"] = "core_model"
+    elif mutation == "receipt_raw_outcome":
+        error.harness_result["raw"]["outcome"]["details"]["observed"] += 1
+    elif mutation == "summary":
+        error.harness_result["summary"] = "GAMEAGENT_OUTCOME_CLASS=infrastructure"
+    elif mutation == "source":
+        error.result.raw["outcome"]["source"] = "core_model"
+    elif mutation == "boolean_limit":
+        error.result.raw["outcome"]["details"]["limit"] = True
+    elif mutation == "limit_not_exceeded":
+        error.result.raw["outcome"]["details"]["observed"] = 65536
+    elif mutation == "unexpected_detail":
+        error.result.raw["outcome"]["details"]["extra"] = "value"
+    elif mutation == "continuations":
+        error.harness_result["continuations"] = 0
+    else:
+        error.harness_result["turn_statuses"] = ["failed"]
+
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        == "unknown_failure_reject"
+    )
+
+
 def test_core_context_budget_exhaustion_keeps_zero_with_matching_native_receipt():
     error = _core_context_failure_error()
 
@@ -1104,6 +1376,118 @@ def _set_core_failure_outcome(error, outcome):
     error.harness_result["raw"]["outcome"] = deepcopy(outcome)
 
 
+def _core_tool_argument_budget_failure_error() -> ArenaTaskFailedError:
+    """Reproduce the production Core decoder's 64 KiB tool argument failure."""
+    error = _core_model_failure_error(
+        "LLM_RESPONSE_FAILED",
+        "empty_completion",
+        "tool_call_budget_exceeded: argument_bytes (limit 65536, observed 71071)",
+    )
+    _set_core_failure_outcome(
+        error,
+        {
+            "code": "LLM_RESPONSE_FAILED",
+            "class": "agent",
+            "source": "core_tool_decoder",
+            "details": {
+                "budget": "argument_bytes",
+                "code": "tool_call_budget_exceeded",
+                "limit": 65536,
+                "observed": 71071,
+            },
+        },
+    )
+    return error
+
+
+@pytest.mark.parametrize("interaction_count", [0, 1, 3])
+def test_core_tool_argument_budget_failure_requires_exportable_interactions(
+    interaction_count,
+):
+    """A decoder budget violation is a model zero, independent of proxy flags."""
+    error = _core_tool_argument_budget_failure_error()
+    assert ArenaStreamAgentWorkflow.classify_proxy_failure(
+        error, context_overflow=False, interaction_count=interaction_count
+    ) == ("model_failure_zero" if interaction_count else "unknown_failure_reject")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "infrastructure",
+        "wrong_source",
+        "wrong_budget",
+        "wrong_code",
+        "not_exceeded",
+        "boolean_limit",
+        "string_observed",
+        "missing_receipt",
+        "wrong_message",
+        "wrong_outcome",
+        "runner_timeout",
+        "external_interruption",
+        "receipt_failure",
+        "failed_collection",
+        "malformed_collection",
+        "eval_failed",
+        "missing_score",
+    ],
+)
+def test_core_tool_argument_budget_conflicting_evidence_stays_rejected(mutation):
+    """Only the matching agent-origin terminal byte violation earns reward zero."""
+    error = _core_tool_argument_budget_failure_error()
+    if mutation in {
+        "infrastructure",
+        "wrong_source",
+        "wrong_budget",
+        "wrong_code",
+        "not_exceeded",
+        "boolean_limit",
+        "string_observed",
+    }:
+        outcome = deepcopy(error.result.raw["outcome"])
+        if mutation == "infrastructure":
+            outcome["class"] = "infrastructure"
+        elif mutation == "wrong_source":
+            outcome["source"] = "provider_http"
+        else:
+            key, value = {
+                "wrong_budget": ("budget", "tool_count"),
+                "wrong_code": ("code", "invalid_tool_json"),
+                "not_exceeded": ("observed", 65536),
+                "boolean_limit": ("limit", True),
+                "string_observed": ("observed", "71071"),
+            }[mutation]
+            outcome["details"][key] = value
+        _set_core_failure_outcome(error, outcome)
+    elif mutation == "missing_receipt":
+        error.harness_result = None
+    elif mutation == "wrong_message":
+        error.harness_result["error"][0]["message"] = "HTTP 503 service unavailable"
+    elif mutation == "wrong_outcome":
+        error.harness_result["error"][0]["outcome"]["details"]["observed"] = 90000
+    elif mutation == "runner_timeout":
+        error.harness_result["observed_runner_timeout"] = True
+    elif mutation == "external_interruption":
+        error.harness_result["observed_external_interruption"] = True
+    elif mutation == "receipt_failure":
+        error.harness_result["failure"] = {"kind": "collect_failed"}
+    elif mutation == "failed_collection":
+        error.harness_result["collection"] = {"status": "ERROR"}
+    elif mutation == "malformed_collection":
+        error.harness_result["collection"] = None
+    elif mutation == "eval_failed":
+        error.status = "EVAL_FAILED"
+    else:
+        error.result = replace(error.result, score=None)
+    assert (
+        ArenaStreamAgentWorkflow.classify_proxy_failure(
+            error, context_overflow=False, interaction_count=2
+        )
+        != "model_failure_zero"
+    )
+
+
 def _core_review_failure_error(failure="invalid_tool_json", completed_turns=1):
     if failure == "invalid_tool_json":
         error = _core_tool_json_failure_error()
@@ -1111,6 +1495,8 @@ def _core_review_failure_error(failure="invalid_tool_json", completed_turns=1):
         error = _core_context_failure_error()
     elif failure == "provider_context":
         error = _provider_context_failure_error()
+    elif failure == "tool_argument_budget":
+        error = _core_tool_argument_budget_failure_error()
     elif failure == "output_limit":
         error = _core_model_failure_error(
             "LLM_OUTPUT_TOKEN_LIMIT_EXCEEDED",
@@ -1143,6 +1529,7 @@ def _core_review_failure_error(failure="invalid_tool_json", completed_turns=1):
         "provider_context",
         "output_limit",
         "empty_response",
+        "tool_argument_budget",
     ],
 )
 @pytest.mark.parametrize("completed_turns", [1, 2, 4])
@@ -1369,12 +1756,28 @@ def test_core_single_turn_legacy_receipt_keeps_existing_compatibility():
 
 @pytest.mark.parametrize(
     "failure",
-    ["legacy_context", "current_context", "provider_context", "whitebox_deadline"],
+    [
+        "legacy_context",
+        "current_context",
+        "provider_context",
+        "whitebox_deadline",
+        "tool_budget",
+        "tool_argument_budget",
+    ],
 )
 def test_context_budget_failure_fetches_native_receipt_before_classification(
     monkeypatch,
     failure,
 ):
+    for proxy_var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(proxy_var, raising=False)
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "llm-key")
     workflow = ArenaStreamAgentWorkflow(
@@ -1390,13 +1793,18 @@ def test_context_budget_failure_fetches_native_receipt_before_classification(
         error.whitebox_lifecycle = None
         fetch_method = "get_whitebox_lifecycle_async"
     else:
-        error = (
-            _current_core_context_failure_error()
-            if failure == "current_context"
-            else _core_context_failure_error()
-        )
+        if failure == "tool_budget":
+            error = _core_tool_budget_failure_error()
+        else:
+            error = (
+                _current_core_context_failure_error()
+                if failure == "current_context"
+                else _core_context_failure_error()
+            )
         if failure == "provider_context":
             error = _provider_context_failure_error()
+        elif failure == "tool_argument_budget":
+            error = _core_tool_argument_budget_failure_error()
         receipt = error.harness_result
         error.harness_result = None
         fetch_method = "get_harness_result_async"
@@ -1568,6 +1976,37 @@ def test_workflow_audits_recovered_failure_with_final_zero_reward(
     assert records[0]["arena_score"] == 0.0
     assert records[0]["training_score"] == 0.0
     assert records[0]["raw"] == {"failure": "context_overflow"}
+
+
+def test_core_tool_budget_failure_audits_zero_after_proxy_classification(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
+    workflow = ArenaStreamAgentWorkflow(
+        econfig={
+            "arena_base_url": "https://arena.example",
+            "arena_result_dump_dir": str(tmp_path / "arena-results"),
+            "stream_id": "stream-a",
+        }
+    )
+    data = {"stream_id": "stream-a", "data_id": "data-a"}
+    error = _core_tool_budget_failure_error()
+    disposition = workflow.classify_proxy_failure(
+        error, context_overflow=False, interaction_count=2
+    )
+
+    async def persist_episode() -> None:
+        await workflow.record_failure_disposition(data, error, disposition)
+        await workflow.persist_episode_result(data, 0.0)
+
+    asyncio.run(persist_episode())
+
+    dump_file = next((tmp_path / "arena-results").glob("arena_results_*.jsonl"))
+    records = [json.loads(line) for line in dump_file.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["status"] == "HARNESS_FAILED"
+    assert records[0]["arena_score"] == 0.0
+    assert records[0]["training_score"] == 0.0
 
 
 def test_workflow_audits_rejected_failure_without_training_reward(
@@ -2517,3 +2956,48 @@ def _whitebox_deadline_error():
         "native_receipt_synthesized": False,
     }
     return error
+
+
+@pytest.mark.parametrize("failure", ["tool_argument_budget", "empty_completion", None])
+def test_arena_failure_reason_rates_include_successes_in_denominator(
+    monkeypatch, failure
+):
+    """Dedicated cause rates count every terminal task, including successful ones."""
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+    agent = ArenaStreamAgentWorkflow(
+        econfig={
+            "arena_base_url": "https://arena.example",
+            "arena_streams": [{"name": "test", "stream_id": "stream"}],
+        }
+    )
+    metrics = {}
+    monkeypatch.setattr(
+        "examples.swe.arena_agent._record_arena_metrics",
+        lambda **values: metrics.update(values),
+    )
+    if failure == "tool_argument_budget":
+        error = _core_tool_argument_budget_failure_error()
+    elif failure == "empty_completion":
+        error = _core_model_failure_error(
+            "LLM_RESPONSE_FAILED",
+            "empty_completion",
+            "model stopped without visible output or tool calls",
+        )
+    else:
+        error = None
+    result = (
+        error.result
+        if error
+        else ArenaTaskResult(task_id="success", status="OK", score=0.5)
+    )
+    agent._task_result.set(result)
+    agent._record_attempt_metrics({}, error)
+    for reason in ("tool_call_argument_bytes_exceeded", "empty_completion"):
+        expected = "tool_argument_budget" if reason.startswith("tool_call") else reason
+        assert metrics[f"harness_error/{reason}"] == float(failure == expected)
+    metadata = agent.get_episode_metadata()
+    assert metadata.get("harness_failure_reason") == (
+        "tool_call_argument_bytes_exceeded"
+        if failure == "tool_argument_budget"
+        else failure
+    )

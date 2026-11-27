@@ -40,9 +40,9 @@ $$J_{RKL}(\theta) = \mathbb{E}_{q, {o_i} \sim \pi_{\theta_{old}}} \left[
 其中奖励为 $R_{i,t} = \log \pi_T(o_{i,t}) - \log \pi_\theta(o_{i,t})$。这会提升教师偏好 token
 的概率，并抑制教师认为不合理的 token。
 
-- 实现细节：纯 KD 场景下需将 `rl_loss_weight` 设为 0。实现会用重要性采样估计 RKL 梯度。代码中以
-  `teacher_logp - logprobs` 作为奖励（$R_{i,t}$），并通过负号系数将目标转为最小化（见
-  `areal/trainer/ppo/actor.py`）。
+- 实现细节：纯 KD 场景下需将 `rl_loss_weight` 设为 0。代码以 `teacher_logp - logprobs`（$R_{i,t}$）作为
+  actor PPO loss 的逐 token advantage，因此重要性比值与 RL 一样受 `eps_clip` 裁剪和
+  `rejection_sampling` 过滤，loss 再乘以 `distill_loss_weight`（见 `areal/trainer/ppo/actor.py`）。
 
 ### GRPO 与 KD 联合
 
@@ -58,8 +58,10 @@ $$J_{KDRL}(\theta) = J_{GRPO}(\theta) - \beta D_{KL}(\pi_\theta \parallel
 $\nabla_\theta J_{KDRL}(\theta)$ 是 $\nabla_\theta J_{GRPO}( \theta) + \beta
 \cdot \nabla_\theta J_{RKL}(\theta)$ 的无偏估计。
 
-- 实现细节：在联合损失场景（`rl_loss_weight` > 0）中，RKL 作为直接正则项。最小化 `logprobs - teacher_logp`，在学生分布
-  $\pi_\theta$ 采样下与最小化 $D_{KL}(\pi_\theta \parallel \pi_T)$ 等价。代码实现为：
+- 实现细节：在联合损失场景（`rl_loss_weight` > 0）中，RKL 作为直接正则项。直接反传 `logprobs - teacher_logp`
+  得到的梯度是 $\nabla_\theta \log \pi_\theta$，与教师无关，且在学生样本上期望为 0。因此代码使用 k2 估计
+  $\frac{1}{2}(\log \pi_\theta - \log \pi_T)^2$，其梯度 $(\log \pi_\theta - \log \pi_T) \nabla_\theta \log \pi_\theta$
+  在学生分布 $\pi_\theta$ 采样下即为 RKL 梯度。代码实现为：
   `loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty`
 
 ## 运行示例

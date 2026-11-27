@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib
+import inspect
+from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 
@@ -35,3 +38,18 @@ def import_from_string(module_path: str) -> Any:
         ) from e
 
     return obj
+
+
+def bind_filter_kwargs(
+    fn: Callable[[dict[str, Any]], bool] | None,
+    kwargs: dict[str, Any] | None,
+) -> Callable[[dict[str, Any]], bool] | None:
+    """Bind rollout filter options on the worker, validating its sample argument."""
+    if not kwargs:
+        return fn
+    if fn is None:
+        raise ValueError("should_accept_kwargs requires should_accept_fn")
+    # Check options before submitting any rollout, including accidental rebinding
+    # of the positional sample argument. Do not evaluate the filter here.
+    inspect.signature(fn).bind(None, **kwargs)
+    return partial(fn, **kwargs)
