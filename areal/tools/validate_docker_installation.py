@@ -37,6 +37,10 @@ class DockerInstallationValidator(BaseInstallationValidator):
             "megatron.core.parallel_state",
             "megatron.core.tensor_parallel",
         ],
+        "emerging-optimizers": [
+            "emerging_optimizers.orthogonalized_optimizers",
+            "emerging_optimizers.orthogonalized_optimizers.muon_utils",
+        ],
         # DeepSeek-V3 related packages
         "flash_mla": ["flash_mla"],
         "deep_gemm": ["deep_gemm"],
@@ -55,6 +59,7 @@ class DockerInstallationValidator(BaseInstallationValidator):
         "transformer_engine",
         "flash_attn_3",
         "megatron-core",
+        "emerging-optimizers",
         "mbridge",
         "megatron-bridge",
         "causal_conv1d",
@@ -138,6 +143,11 @@ class DockerInstallationValidator(BaseInstallationValidator):
             )
 
         # Megatron packages (from cuda-train > megatron extra)
+        self.add_additional_package(
+            "emerging-optimizers",
+            opt_versions.get("emerging-optimizers", ""),
+            required=True,
+        )
         self.add_additional_package(
             "megatron-core",
             opt_versions.get("megatron-core", ""),

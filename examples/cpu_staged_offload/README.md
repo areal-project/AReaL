@@ -24,6 +24,31 @@ optimizer, precision-aware optimizer semantics, and FP32 master/moment state. En
 it selects precision-aware mode automatically. Staged optimizer checkpoint saves are
 synchronous; `megatron.async_save=true` is rejected.
 
+The Muon optimizer can use the same staging infrastructure:
+
+```yaml
+actor:
+  optimizer:
+    type: dist_muon
+    muon:
+      momentum: 0.95
+      num_ns_steps: 5
+      tp_mode: duplicated
+  megatron:
+    ddp:
+      use_distributed_optimizer: false
+    cpu_staged_offload:
+      enabled: true
+      buffer_count: 1
+      bucket_size_mb: 128
+```
+
+Set `cpu_staged_offload.enabled: false` for native layer-wise Muon. Both modes use
+Megatron-Core 0.19.0 and emerging-optimizers 0.3.0 and require BF16 and synchronous
+parameter gather. CPU staging supports `tp_mode: duplicated`; TP or expert-TP greater
+than one requires `buffer_count: 1`. Staged checkpoints support DP ownership resharding
+with fixed model-parallel topology; native checkpoints require fixed DP topology.
+
 Checkpoint loading is fail-stop. DCP writes optimizer state into the authoritative CPU
 slabs in place. If loading fails, the process must terminate and AReaL recovery starts a
 new process from the last complete checkpoint; no in-process disk snapshot, rollback, or
