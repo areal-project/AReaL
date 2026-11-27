@@ -10,6 +10,7 @@ from typing import Any
 
 BACKEND = "areal_sampling_mask"
 PLUGIN = "areal_sampling_mask"
+JOINT_DSPARK = "AREAL_DSPARK"
 LEGACY_VERSION = "0.5.10.post1"
 NATIVE_VERSIONS = ("0.5.19", "0.5.20")
 _registered = False
@@ -146,6 +147,10 @@ def register() -> None:
         installed = integration_version()
         from areal.engine.sglang_sampling_mask import register_backend
 
+        if installed == "0.5.20":
+            from areal.engine.sglang_dspark_registration import register_dspark
+
+            register_dspark()
         register_backend()
         if installed == LEGACY_VERSION:
             _install_legacy_hooks()

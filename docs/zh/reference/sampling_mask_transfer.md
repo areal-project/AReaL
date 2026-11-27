@@ -87,8 +87,13 @@ torchrun --standalone --nproc-per-node=2 tests/torchrun/run_sampling_mask_gin.py
 ```
 
 目前不支持 repetition/frequency/presence penalty、min-p、logit bias、grammar、 自定义 logits
-processor、speculative decoding、推理 PP/attention CP、蒸馏、 tree training 和 auxiliary
-token/top logprobs；这些路径报错，不静默采用另一种 概率定义。训练请求必须使用配置中的 temperature/top-p。
+processor、DSpark 以外的投机算法、推理 PP/attention CP、蒸馏、 tree training 和 auxiliary token/top
+logprobs；这些路径报错，不静默采用另一种 概率定义。训练请求必须使用配置中的 temperature/top-p。
+
+SGLang 0.5.20 支持在 `sampling_mask_transfer: true` 时使用
+`sglang.speculative_algorithm: DSPARK` 和 `sglang.speculative_draft_model_path`。普通采样和随机
+verify 使用相同的 joint top-k/top-p 分布；verify 仅发布实际提交的 token（包括拒绝时的替代 token 和全接收时的 bonus）的
+mask 和目标 logprob。此模式要求随机采样且不指定请求级 seed。
 
 当整个 actor TP 组与采样端位于同一共享内存命名空间时，同卡和异卡都可按 rollout 已保存的行号直接读 mask，支持
 TP=1。每个训练分片在批内首次遇到一个来源时查询一次 `/info`，用 producer nonce 校验来源并取得页目录。每页覆盖连续 16,384 个行号，索引每行

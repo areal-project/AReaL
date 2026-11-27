@@ -208,3 +208,41 @@ def test_launch_server_omits_legacy_mask_retention_from_final_command(
     if top_k is not None:
         assert "--skip-server-warmup" in command
         assert child.call_args.kwargs["env"]["AREAL_SAMPLING_MASK_TOP_K"] == str(top_k)
+
+
+@pytest.mark.parametrize("installed", ["0.5.10.post1", "0.5.19", "0.5.20"])
+def test_masked_dspark_launch_selects_native_worker(monkeypatch, installed):
+    from areal.engine import sglang_sampling_mask_plugin as plugin
+
+    monkeypatch.setattr(plugin, "version", lambda name: installed)
+    launch = MagicMock()
+    monkeypatch.setattr(sglang_remote.subprocess, "Popen", launch)
+    args = dict(
+        port=19000,
+        nccl_port=19001,
+        _sampling_mask_top_k=50,
+        speculative_algorithm="DSPARK",
+        dp_size=2,
+        enable_dp_attention=True,
+        cuda_graph_bs=[1, 2],
+        mamba_scheduler_strategy="extra_buffer",
+        torchao_config="",
+    )
+    backend = sglang_remote.SGLangBackend()
+    if installed != "0.5.20":
+        with pytest.raises(ValueError, match="requires SGLang 0.5.20"):
+            backend.launch_server(args)
+        launch.assert_not_called()
+        return
+    backend.launch_server(args)
+    cmd = launch.call_args.args[0]
+    assert "sglang.launch_server" in cmd
+    assert cmd[cmd.index("--speculative-algorithm") + 1] == plugin.JOINT_DSPARK
+    assert "--enable-dp-lm-head" in cmd
+    assert "--cuda-graph-bs-decode" in cmd
+    assert "--mamba-radix-cache-strategy" in cmd
+    assert "--torchao-config" not in cmd
+    assert (
+        launch.call_args.kwargs["env"]["SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"]
+        == "0"
+    )

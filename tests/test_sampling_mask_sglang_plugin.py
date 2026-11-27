@@ -106,6 +106,13 @@ def upstream_runtime(request, monkeypatch):
     root = Path(source_root) / f"v{installed}" / "srt"
     assert (root / "layers/sampler.py").is_file()
     monkeypatch.setattr(plugin, "version", lambda name: installed)
+    # This fixture isolates the ordinary sampler from the spec worker package.
+    # Its real registry/factory is exercised in test_dspark_sampling_mask.
+    install_module(
+        monkeypatch,
+        "areal.engine.sglang_dspark_registration",
+        register_dspark=lambda: None,
+    )
     for package in (
         "sglang",
         "sglang.srt",
@@ -417,6 +424,50 @@ def test_upstream_factory_instantiates_and_samples_restricted_policy(
     assert plugin.BACKEND in runtime.sampler._CUSTOM_SAMPLER_FACTORIES
 
 
+@pytest.mark.parametrize("upstream_runtime", ["0.5.20"], indirect=True)
+def test_dspark_prefill_and_verify_use_scheduled_rows(upstream_runtime, monkeypatch):
+    from areal.infra.sampling_mask import service
+
+    upstream_runtime.settings.speculative_algorithm = plugin.JOINT_DSPARK
+    monkeypatch.setattr(service, "MaskProducer", lambda *args, **kwargs: object())
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    monkeypatch.setenv("AREAL_SAMPLING_MASK_TOP_K", "3")
+    monkeypatch.setenv("AREAL_SAMPLING_MASK_RECEIVERS", "1")
+    sampler = upstream_runtime.sampler.create_sampler(plugin.BACKEND)
+    info = SimpleNamespace(
+        has_custom_logit_processor=False,
+        is_any_greedy=False,
+        grammars=None,
+        temperatures=torch.ones(2),
+        top_ps=torch.full((2,), 0.95),
+        top_ks=torch.full((2,), 3),
+        sampling_seed=None,
+        _areal_mask_versions=[17, 15],
+        _areal_mask_leases=[(1, 2, 3), (4, 5, 6)],
+    )
+    logits = torch.tensor([[3.0, 1.0, 2.0, 0.0], [2.0, 3.0, 0.0, 1.0]])
+    output = SimpleNamespace(next_token_logits=logits)
+    tokens = sampler(output, info, True, [], [], torch.zeros(2))
+    policy = sampler.prepare_verify_policy(
+        logits.repeat_interleave(2, dim=0),
+        SimpleNamespace(
+            sampling_info=info, top_logprobs_nums=[], token_ids_logprobs=[]
+        ),
+        2,
+    )
+    for rows in (output.auxiliary_device_output, policy.rows):
+        assert rows.versions == [17, 15]
+        assert rows.leases == [(1, 2, 3), (4, 5, 6)]
+    assert torch.equal(output.auxiliary_device_output.ids, policy.rows.ids[::2])
+    torch.testing.assert_close(
+        policy.target_probs[torch.arange(2), 0, tokens.long()].log(),
+        output.next_token_logprobs,
+        atol=1e-6,
+        rtol=0,
+    )
+
+
 @pytest.mark.parametrize("backend", [plugin.BACKEND, "flashinfer", "pytorch"])
 def test_upstream_deterministic_resolution_preserves_only_our_backend(
     upstream_runtime, backend
@@ -518,6 +569,7 @@ def test_workflow_leases_survive_schedule_filter_and_forward(upstream_runtime):
                 repetition_penalty=1,
                 logit_bias=None,
                 min_p=0,
+                min_new_tokens=0,
             ),
         )
 
