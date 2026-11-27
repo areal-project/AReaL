@@ -2834,6 +2834,10 @@ class SGLangConfig:
                 value = args.pop(key, None)
                 if value is not None:
                     args.setdefault(f"{key}_decode", value)
+            # SGLang renamed the hybrid-Mamba radix cache strategy option.
+            mamba_strategy = args.pop("mamba_scheduler_strategy", None)
+            if mamba_strategy is not None:
+                args.setdefault("mamba_radix_cache_strategy", mamba_strategy)
         return get_py_cmd("areal.v2.inference_service.sglang.launch_server", args)
 
     @staticmethod

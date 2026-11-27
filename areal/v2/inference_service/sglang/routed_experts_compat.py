@@ -173,10 +173,17 @@ def _patch_v0520_routed_experts_cache() -> bool:
         schedule = get_schedule()
         prefill_rows = _positive_int(max_prefill_buffer_tokens()) or 0
         if not _positive_int(getattr(schedule, "chunked_prefill_size", None)):
-            prefill_rows = max(
-                prefill_rows,
-                _positive_int(getattr(schedule, "max_prefill_tokens", None)) or 0,
+            # Without chunked prefill, SGLang can still admit the first request
+            # in a batch above max_prefill_tokens up to min(context_len, pool).
+            max_prefill_tokens = (
+                _positive_int(getattr(schedule, "max_prefill_tokens", None)) or 0
             )
+            context_len = _positive_int(getattr(model_config, "context_len", None)) or 0
+            unchunked_rows = max(max_prefill_tokens, context_len)
+            pool_tokens = _positive_int(num_tokens)
+            if pool_tokens is not None:
+                unchunked_rows = min(unchunked_rows, pool_tokens)
+            prefill_rows = max(prefill_rows, unchunked_rows)
         # The native constructor multiplies by dp_size and also sizes the
         # scattered-A2A gather buffer from the resulting device cache.
         # Keep allocation outside capture so CUDA graphs retain valid pointers.

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -7,6 +8,52 @@ import torch
 
 from areal.engine.awex.adapters import fsdp_adapter, megatron_adapter, sglang_adapter
 from areal.engine.awex.transport import nccl_group
+
+
+@pytest.mark.parametrize(
+    ("torch_version", "expected_param"),
+    [
+        ("2.5.1+cu124", "pg_options"),
+        ("2.6.0+cu124", "backend_options"),
+        ("2.13.0+cu130", "backend_options"),
+    ],
+)
+def test_init_custom_process_group_selects_options_param_by_torch_version(
+    monkeypatch, torch_version, expected_param
+):
+    """Compare Torch versions semantically so 2.13+ still passes backend_options."""
+    import torch.distributed.distributed_c10d as c10d
+
+    fake_pg = MagicMock(name="custom_pg")
+    fake_store = MagicMock(name="store")
+    sentinel_options = MagicMock(name="options")
+    captured_kwargs = {}
+
+    def fake_new_pg_helper(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return fake_pg, None
+
+    fake_world = SimpleNamespace(pg_group_ranks={})
+    monkeypatch.setattr(nccl_group.torch, "__version__", torch_version)
+    monkeypatch.setattr(c10d, "_new_process_group_helper", fake_new_pg_helper)
+    monkeypatch.setattr(c10d, "_world", fake_world)
+
+    pg = nccl_group.init_custom_process_group(
+        backend="gloo",
+        world_size=2,
+        rank=0,
+        store=fake_store,
+        group_name="awex_test",
+        pg_options=sentinel_options,
+    )
+
+    assert pg is fake_pg
+    assert captured_kwargs[expected_param] is sentinel_options
+    other_param = (
+        "pg_options" if expected_param == "backend_options" else "backend_options"
+    )
+    assert other_param not in captured_kwargs
+    assert fake_world.pg_group_ranks[fake_pg] == {0: 0, 1: 1}
 
 
 def test_setup_batch_isend_irecv_uses_sidecar_for_final_barrier(monkeypatch):
