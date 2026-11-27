@@ -1,0 +1,26 @@
+areal/api/cli_args.py
+  h_0f206e897c097a 1178-1190,1260-1261
+areal/models/mcore/registry.py
+  h_0f206e897c097a 447-453
+docs/en/cli_reference.md
+  h_0f206e897c097a 1341
+docs/zh/cli_reference.md
+  h_0f206e897c097a 1339
+tests/test_megatron_bridge_deterministic.py
+  h_0f206e897c097a 19,83,93,139-172
+tests/test_megatron_engine_vlm_distributed.py
+  h_0f206e897c097a 183-203
+tests/torchrun/run_megatron_engine_vlm_distributed.py
+  h_0f206e897c097a 15-24,45,49,167,176-180,446-498,566,587-588
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e7c8145bc05c6825301e28818fb608f95fce33bb",
+  "prompts": {},
+  "humans": {
+    "h_0f206e897c097a": {
+      "author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
