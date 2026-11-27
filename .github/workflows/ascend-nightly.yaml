@@ -1,0 +1,14 @@
+# Install this file on main. Benchmark policy and jobs live on ascend.
+name: Ascend nightly
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  trigger:
+    if: github.repository == 'areal-project/AReaL'
+    permissions:
+      contents: write
+      actions: read
+    uses: areal-project/AReaL/.github/workflows/ascend-nightly.yml@ascend

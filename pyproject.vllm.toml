@@ -194,7 +194,7 @@ cuda = [
     "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 sandbox = [
-    "daytona>=0.167.0",
+    "daytona>=0.167.0,<1",
 ]
 cli = [
     "click>=8.1",

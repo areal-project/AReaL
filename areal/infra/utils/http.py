@@ -160,6 +160,8 @@ async def arequest_with_retry(
     timeout: float | None = None,
     retry_delay: float = 1.0,
     verbose=False,
+    generation_error: Callable[[int, str], Exception | None] | None = None,
+    on_retry_error: Callable[[Exception], None] | None = None,
     response_size_observer: Callable[[int], None] | None = None,
 ) -> dict | str | bytes:
     if timeout is None:
@@ -207,6 +209,14 @@ async def arequest_with_retry(
                         logger.info("http requests return")
                     if response.status >= 400:
                         error_body = await _read_http_error_body(response)
+                        # A previous failed POST may still be executing. A
+                        # later timeout cannot prove that attempt terminated.
+                        if generation_error is not None and attempt == 0:
+                            terminal_error = generation_error(
+                                response.status, error_body
+                            )
+                            if terminal_error is not None:
+                                raise terminal_error
                         try:
                             response.raise_for_status()
                         except aiohttp.ClientResponseError as exc:
@@ -231,6 +241,8 @@ async def arequest_with_retry(
                 aiohttp.ClientError,
                 aiohttp.ClientResponseError,
             ) as e:
+                if on_retry_error is not None:
+                    on_retry_error(e)
                 if isinstance(e, asyncio.TimeoutError):
                     logger.warning(
                         "HTTP request to %s%s timed out after %.2fs (attempt %d/%d)",

@@ -36,6 +36,7 @@ from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.infra.workflow_executor import WorkflowTaskResult
 from areal.utils import perf_tracer, stats_tracker
+from areal.utils.errors import ModelExecutionTimeoutError
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, format_host_for_url
 from areal.utils.sglang_image import image_request_kwargs
@@ -107,6 +108,26 @@ class SGLangBackend:
 
     def __init__(self) -> None:
         self._readiness_endpoint = "/health"
+
+    @staticmethod
+    def generation_error(status: int, error_body: str) -> Exception | None:
+        """Recognize SGLang's running deadline, never generic HTTP 503 errors."""
+        if status != 503:
+            return None
+        try:
+            error = json.loads(error_body)
+        except (TypeError, ValueError):
+            return None
+        if (
+            isinstance(error, dict)
+            and error.get("object") == "error"
+            and error.get("message") == "Request running timeout reached."
+            and error.get("type") == "503"
+            and type(error.get("code")) is int
+            and error["code"] == 503
+        ):
+            return ModelExecutionTimeoutError()
+        return None
 
     @staticmethod
     def is_generation_rejection(status: int, error_body: str) -> bool:
@@ -240,6 +261,12 @@ class SGLangBackend:
         finish_reason = meta_info["finish_reason"]
         stop_reason = finish_reason["type"]
         stop_message = finish_reason.get("message", "")
+        if (
+            stop_reason == "abort"
+            and finish_reason.get("status_code") == 503
+            and stop_message == "Request running timeout reached."
+        ):
+            raise ModelExecutionTimeoutError()
 
         # Extract routed_experts information if available
         routed_experts = meta_info.get("routed_experts", None)

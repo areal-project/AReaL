@@ -36,6 +36,7 @@
 | Megatron-Core      | core_v0.19.0                                                 |
 | Transformers       | 5.3.0                                                        |
 | Ray                | 2.59.0                                                       |
+| aiter              | 0.1.14.post1（基础镜像自带）                                 |
 
 **注意**：本教程不涵盖 AMD GPU 驱动和共享存储的安装。驱动安装请参考
 [ROCm 安装指南](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/)。
@@ -128,6 +129,10 @@ pip install --no-deps --no-build-isolation -e .
     `Option spirv-expand-step registered more than once` 并退出。
   - 使用 Megatron 时设置 `NVTE_FLASH_ATTN=1` 和 `NVTE_FUSED_ATTN=1`。其中任何一个为 `0` 时，Megatron 的
     `attention_backend=auto` 会在启动时断言失败。
+  - 开启 aiter 时设置 `OPUS_FP32_to_BF16_DEFAULT=0` 和
+    `CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0`。aiter 0.1.14 在 gfx942 上默认把 fp32 截断为 bf16，会使训推
+    logprob 差异约增大一倍；设为 `0` 改为就近舍入。这两个变量只影响设置之后 才编译的 kernel，如果 `~/.aiter/build/`
+    下已有编译结果，请删除后重新运行。
 
 - 如果自己安装 SGLang 并打算开启 `SGLANG_USE_AITER=1`，请在安装之后、开始训练之前执行一次下面的命令。它会给 AReaL 当前对应的 SGLang
   0.5.10.post1 版本打补丁，使在线权重更新后 MoE 权重仍保持 aiter 要求的布局；遇到其他 SGLang 版本时会拒绝执行。不开启 aiter
@@ -156,14 +161,33 @@ pip install --no-deps --no-build-isolation -e .
    `flashinfer`、`fa3` 和 `triton`。您显式设置的其他后端会原样传给 SGLang，例如
    `+sglang.attention_backend=triton`。
 
+## 使用 aiter 加速 rollout
+
+[aiter](https://github.com/ROCm/aiter) 是 AMD 的高性能算子库。推荐在 rollout 中开启，以达到更优的性能。例如，在 8 ×
+MI308X 上用 SGLang 训练 Qwen3-30B-A3B 时，**开启 aiter 后 rollout 约快 3 倍**，并且不影响训推一致性。
+
+使用 `Dockerfile.rocm` 构建的镜像已包含 MoE 布局补丁和舍入变量，启动训练前只需按推理后端 export `SGLANG_USE_AITER=1` 或
+`VLLM_ROCM_USE_AITER=1`。使用 vLLM 时需同时加上 `+rollout.setup_timeout=1200`，以免首次编译 aiter kernel
+超过默认 300 秒的启动超时。
+
+如果没有使用镜像，自己安装环境时，训练前请确认：
+
+- **MoE 布局补丁（SGLang + MoE 模型）**：先执行上面的 `sglang_aiter_moe_layout` 补丁，否则第一次权重同步后 MoE
+  层的输出会出错。
+- **舍入变量**：设置 `OPUS_FP32_to_BF16_DEFAULT=0` 和
+  `CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=0`。不设置时，gfx942（MI300X/MI308X）上的训推一致性会变差；gfx950（MI350X/MI355X）不受影响，设置与否结果相同。
+
+**注意**：aiter v0.1.28 及以上的默认值已不再截断，无需设置舍入变量；但如果镜像环境中已显式设置了
+`CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=2`，仍需将其改为 `0`。
+
 ## 环境变量
 
-| 变量                              | 作用                                                                                                                                                |
-| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SGLANG_USE_AITER=1`              | 可选，默认关闭。让 SGLang 的 MoE、LayerNorm 等算子使用 aiter kernel，不影响 attention。MoE 模型可以开启，开启后需要上面的 MoE 布局补丁。            |
-| `VLLM_ROCM_USE_AITER=1`           | 可选，默认关闭。让 vLLM 使用 aiter kernel。首次启动要编译 aiter kernel，可能超过默认 300 秒的启动超时，需要加 `+rollout.setup_timeout=1200`。       |
-| `AREAL_ALLOW_DEFAULT_ADMIN_KEY=1` | 在非回环地址上启动服务、且没有设置自定义 `admin_api_key` 时必须设置，否则 AReaL 会拒绝启动。只应在可信网络中使用。                                  |
-| `VLLM_SERVER_DEV_MODE=1`          | 可选，只有 vLLM 共卡模式需要，请在启动训练前 export。vLLM 0.19.1 只在开发模式下提供共卡模式所需的 `/sleep` 和 `/wake_up` 接口。分离部署不需要设置。 |
+| 变量                              | 作用                                                                                                                                                         |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `SGLANG_USE_AITER=1`              | 推荐开启，默认关闭。让 SGLang 的 MoE、LayerNorm 等算子使用 aiter kernel。见[使用 aiter 加速 rollout](#%E4%BD%BF%E7%94%A8-aiter-%E5%8A%A0%E9%80%9F-rollout)。 |
+| `VLLM_ROCM_USE_AITER=1`           | 推荐开启，默认关闭。让 vLLM 使用 aiter kernel。见[使用 aiter 加速 rollout](#%E4%BD%BF%E7%94%A8-aiter-%E5%8A%A0%E9%80%9F-rollout)。                           |
+| `AREAL_ALLOW_DEFAULT_ADMIN_KEY=1` | 在非回环地址上启动服务、且没有设置自定义 `admin_api_key` 时必须设置，否则 AReaL 会拒绝启动。只应在可信网络中使用。                                           |
+| `VLLM_SERVER_DEV_MODE=1`          | 可选，只有 vLLM 共卡模式需要，请在启动训练前 export。vLLM 0.19.1 只在开发模式下提供共卡模式所需的 `/sleep` 和 `/wake_up` 接口。分离部署不需要设置。          |
 
 **注意**：
 

@@ -2753,6 +2753,15 @@ class SGLangConfig:
     )
     enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
+    mm_process_config: dict[str, Any] | None = field(
+        default=None,
+        kw_only=True,
+        metadata={
+            "help": "SGLang multimodal preprocessing options keyed by modality "
+            "(image, video, or audio), such as min_pixels and max_pixels for "
+            "images. None uses SGLang defaults."
+        },
+    )
     limit_mm_data_per_request: dict[str, int] | None = field(
         default=None,
         metadata={
@@ -2933,6 +2942,11 @@ class SGLangConfig:
         if limits is not None:
             args["limit_mm_data_per_request"] = json.dumps(
                 limits, separators=(",", ":")
+            )
+        mm_process_config = args.get("mm_process_config")
+        if mm_process_config is not None:
+            args["mm_process_config"] = json.dumps(
+                mm_process_config, separators=(",", ":")
             )
         if sglang_config.enable_multithread_load:
             model_loader_extra_config = dict(

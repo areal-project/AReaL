@@ -120,6 +120,7 @@ class OpenAIProxyClient:
         self.invalid_tool_json_message = ""
         self.system_error = False
         self.system_error_message = ""
+        self.model_execution_timeout = False
 
     @property
     def session_api_key(self) -> str:
@@ -315,6 +316,9 @@ class OpenAIProxyClient:
             )
             self.system_error = bool(data.get("system_error", False))
             self.system_error_message = str(data.get("system_error_message", ""))
+            self.model_execution_timeout = bool(
+                data.get("model_execution_timeout", False)
+            )
         except Exception as e:
             # Raised errors will be properly handled by OpenAIProxyWorkflow
             logger.warning(f"Failed to end session {self.session_id}: {e}")
