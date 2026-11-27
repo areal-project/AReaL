@@ -7,6 +7,7 @@ Full logits remain live; log-probabilities are computed in checkpointed chunks.
 """
 
 import math
+from itertools import chain
 
 import torch
 import torch.distributed as dist
@@ -34,10 +35,29 @@ def validate_sampling(config) -> None:
         )
 
 
+def _rows_pass_checks(ids, logprobs, width: int) -> bool:
+    """True if every row passes the row checks in validate_heads; False defers to them."""
+    if not all(type(row) is list and len(row) == width for row in chain(ids, logprobs)):
+        return False
+    flat_ids = list(chain.from_iterable(ids))
+    flat_logprobs = list(chain.from_iterable(logprobs))
+    return (
+        set(map(type, flat_ids)) == {int}
+        and set(map(type, flat_logprobs)) == {float}
+        and min(flat_ids) >= 0
+        and all(len(set(row)) == width for row in ids)
+        and math.isfinite(sum(flat_logprobs))
+        and max(flat_logprobs) <= 0
+        and max(sum(map(math.exp, row)) for row in logprobs) <= 1 + 1e-5
+    )
+
+
 def validate_heads(ids, logprobs, count: int, width: int) -> None:
     """Validate CPU transport metadata before it reaches the training hot path."""
     if ids is None or logprobs is None or len(ids) != count or len(logprobs) != count:
         raise ValueError("Missing or misaligned SGLang sampler heads.")
+    if count and _rows_pass_checks(ids, logprobs, width):
+        return
     for row_ids, row_logprobs in zip(ids, logprobs):
         if len(row_ids) != width or len(row_logprobs) != width:
             raise ValueError("Sampler head width differs from the requested width.")
