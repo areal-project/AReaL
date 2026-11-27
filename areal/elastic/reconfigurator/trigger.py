@@ -30,6 +30,7 @@ class ScaleSignal:
     rollout_pressure: float
     actor_action: RoleAction
     rollout_action: RoleAction
+    outstanding_episodes: int = 0
 
     @property
     def reasons(self) -> tuple[str, ...]:
@@ -60,6 +61,8 @@ class CapacityTrigger:
         if cohort_size < 1:
             raise ValueError("Expected a positive workload cohort size")
         self.cohort_size = cohort_size
+        self._evaluator: CapacityEvaluator | None = None
+        self._capacities: tuple[float | None, RolloutCapacity] | None = None
         self._low_streak: dict[str, int] = {"actor": 0, "rollout": 0}
 
     def reset(self) -> None:
@@ -68,17 +71,22 @@ class CapacityTrigger:
         self._low_streak["rollout"] = 0
 
     def _classify(
-        self, role: str, pressure: float, current_gpus: int, min_gpus: int
+        self,
+        role: str,
+        pressure: float,
+        current_gpus: int,
+        min_gpus: int,
+        *,
+        commit: bool = True,
     ) -> RoleAction:
+        low = pressure < self.theta_down and current_gpus > min_gpus
+        streak = self._low_streak[role] + 1 if low else 0
+        if commit:
+            self._low_streak[role] = streak
         if pressure > self.theta_up:
-            self._low_streak[role] = 0
             return "scale_out"
-        if pressure < self.theta_down and current_gpus > min_gpus:
-            self._low_streak[role] += 1
-            if self._low_streak[role] >= self.scale_in_windows:
-                return "scale_in"
-            return "hold"
-        self._low_streak[role] = 0
+        if streak >= self.scale_in_windows:
+            return "scale_in"
         return "hold"
 
     def observe(
@@ -133,20 +141,42 @@ class CapacityTrigger:
         )
         pattern = WorkloadPattern(period, offsets, batch)
         publication = evaluator.publication_duration()
-        actor_cap = evaluator.actor_capacity(current.actor, pattern, publication)
-        target = evaluator.slo.minimum_request_fraction
-        rollout_cap = probe_capacity(
-            lambda load: evaluator.rollout_slo(current.rollout, pattern, load),
-            rate,
-            target,
-        )
+        # The controller binds a new evaluator whenever the deployed layout changes.
+        capacities = self._capacities if self._evaluator is evaluator else None
+        if capacities is not None:
+            actor_cap, rollout_cap = capacities
+            actor_preview = self._classify(
+                "actor",
+                _pressure(rate, actor_cap),
+                current.actor.gpus,
+                min_actor_gpus,
+                commit=False,
+            )
+            rollout_preview = self._classify(
+                "rollout",
+                _pressure(rate, rollout_cap.lower),
+                current.rollout.gpus,
+                min_rollout_gpus,
+                commit=False,
+            )
+            if actor_preview != "hold" or rollout_preview != "hold":
+                capacities = None
+        if capacities is None:
+            actor_cap = evaluator.actor_capacity(current.actor, pattern, publication)
+            rollout_cap = probe_capacity(
+                lambda load: evaluator.rollout_slo(current.rollout, pattern, load),
+                rate,
+                evaluator.slo.minimum_request_fraction,
+            )
+            self._capacities = actor_cap, rollout_cap
+            self._evaluator = evaluator
         actor_p = _pressure(rate, actor_cap)
         rollout_p = _pressure(rate, rollout_cap.lower)
-        actor_action = self._classify(
-            "actor", actor_p, current.actor.gpus, min_actor_gpus
-        )
         rollout_action = self._classify(
             "rollout", rollout_p, current.rollout.gpus, min_rollout_gpus
+        )
+        actor_action = self._classify(
+            "actor", actor_p, current.actor.gpus, min_actor_gpus
         )
         if actor_action == "hold" and rollout_action == "hold":
             return None

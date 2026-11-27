@@ -291,7 +291,9 @@ class WorkloadPattern:
     arrivals: tuple[tuple[float, str], ...]
     templates: tuple[EpisodeView, ...]
 
-    def forecast(self, start: float, horizon_seconds: float) -> Forecast | None:
+    def forecast(
+        self, start: float, horizon_seconds: float, *, episode_count: int | None = None
+    ) -> Forecast | None:
         _nonnegative("horizon_seconds", horizon_seconds, positive=True)
         by_family: dict[str, list[tuple[Turn, ...]]] = defaultdict(list)
         for episode in self.templates:
@@ -302,10 +304,26 @@ class WorkloadPattern:
             return None
         positions: dict[str, int] = defaultdict(int)
         samples = []
-        for cycle in range(math.ceil(horizon_seconds / self.period_seconds)):
+        cycles = math.ceil(horizon_seconds / self.period_seconds)
+        time_scale = 1.0
+        if episode_count is not None:
+            if episode_count <= 0:
+                raise ValueError("episode_count must be positive")
+            full, tail = divmod(episode_count, len(self.arrivals))
+            cycles = full + bool(tail)
+            duration = full * self.period_seconds
+            if tail:
+                # End the partial period one mean arrival interval after its last offer.
+                duration += self.arrivals[tail - 1][0] + self.period_seconds / len(
+                    self.arrivals
+                )
+            time_scale = horizon_seconds / duration
+        for cycle in range(cycles):
             for offset, family in self.arrivals:
-                delay = cycle * self.period_seconds + offset
-                if delay >= horizon_seconds:
+                delay = (cycle * self.period_seconds + offset) * time_scale
+                if episode_count is not None and len(samples) == episode_count:
+                    break
+                if episode_count is None and delay >= horizon_seconds:
                     break
                 pool = by_family[family]
                 turns = pool[positions[family] % len(pool)]

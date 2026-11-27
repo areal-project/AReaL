@@ -243,7 +243,7 @@ class Optimizer:
         gpu_capacity: int,
         place: Callable[[Layout], object],
         *,
-        reconfiguration: ReconfigurationModel | None = None,
+        reconfiguration: ReconfigurationModel,
         horizon_seconds: float = 600.0,
     ):
         self.evaluator = evaluator
@@ -349,35 +349,23 @@ class Optimizer:
         target = self.evaluator.slo.minimum_request_fraction
         publication = signal.publication
         current_rollout = signal.rollout_capacity
-        scale_in_only = (
-            signal.actor_action != "scale_out" and signal.rollout_action != "scale_out"
-        )
-
         split, lock_actor, lock_rollout = self._split(current, signal)
-        if scale_in_only and sum(split) >= current.gpus:
-            return Decision(
-                current,
-                current,
-                split,
-                0,
-                0,
-                "Scale-in does not reduce total GPUs; keeping current layout",
-            )
+
+        actor_evaluations = rollout_evaluations = 0
 
         @cache
-        def actor_capacity(role: RoleLayout):
-            if role == current.actor:
-                return signal.actor_capacity
-            return self.evaluator.actor_capacity(role, pattern, publication)
-
-        @cache
-        def rollout_slo(role: RoleLayout, offered_rate: float):
-            return self.evaluator.rollout_slo(role, pattern, offered_rate)
-
-        def rollout_capacity(role: RoleLayout):
+        def rollout_limit(role: RoleLayout):
+            nonlocal rollout_evaluations
             if role == current.rollout:
-                return current_rollout
-            return probe_capacity(lambda load: rollout_slo(role, load), rate, target)
+                return current_rollout.lower
+            estimate = probe_capacity(
+                lambda load: self.evaluator.rollout_slo(role, pattern, load),
+                rate,
+                target,
+                require_observed_rate=True,
+            )
+            rollout_evaluations += len(estimate.probes)
+            return estimate.lower
 
         inherited = self.space.inherited_attention_dp
 
@@ -423,64 +411,42 @@ class Optimizer:
                 current,
                 layout,
                 split,
-                actor_capacity.cache_info().currsize,
-                rollout_slo.cache_info().currsize,
+                actor_evaluations,
+                rollout_evaluations,
                 reason,
             )
 
+        horizon = self.horizon_seconds
+        demand = signal.outstanding_episodes + rate * horizon
+
+        current_capacity = min(
+            signal.actor_capacity or 0.0, current_rollout.lower or 0.0
+        )
+        current_tasks = min(demand, current_capacity * horizon)
+        current_score = (current_tasks, -current.gpus * horizon)
+
+        def window_score(layout: Layout, capacity: float) -> tuple[float, float]:
+            cutover = self.reconfiguration.predict(current, layout, publication)
+            active_seconds = max(0.0, horizon - cutover.seconds)
+            tasks = min(demand, capacity * active_seconds)
+            gpu_seconds = cutover.gpu_seconds + layout.gpus * active_seconds
+            return tasks, -gpu_seconds
+
         for actor in actors:
-            capacity = actor_capacity(actor)
+            capacity = signal.actor_capacity
+            if actor != current.actor:
+                capacity = self.evaluator.actor_capacity(actor, pattern, publication)
+                actor_evaluations += 1
             if capacity is None or capacity < rate:
                 continue
             for layout in layouts((actor,), rollouts):
-                score = rollout_slo(layout.rollout, rate)
-                if score >= target:
-                    if scale_in_only:
-                        if layout.gpus >= current.gpus:
-                            return result(
-                                current,
-                                "Scale-in does not reduce total GPUs; keeping current layout",
-                            )
-                        if self.reconfiguration is not None:
-                            cutover = self.reconfiguration.predict(
-                                current, layout, publication
-                            )
-                            saved = (current.gpus - layout.gpus) * self.horizon_seconds
-                            if saved <= cutover.gpu_seconds:
-                                return result(
-                                    current,
-                                    "Scale-in GPU savings do not pay back cutover cost; keeping current layout",
-                                )
-                    return result(layout, "Capacity and offered-task SLO meet demand")
+                limit = rollout_limit(layout.rollout)
+                if limit is None or limit < rate:
+                    continue
+                if window_score(layout, min(capacity, limit)) > current_score:
+                    return result(
+                        layout,
+                        "Capacity, offered-task SLO and cutover payback meet requirements",
+                    )
 
-        if scale_in_only:
-            return result(
-                current, "Scale-in target missed demand; keeping current layout"
-            )
-
-        @cache
-        def rollout_lower(role: RoleLayout) -> float:
-            return rollout_capacity(role).lower or 0.0
-
-        feasible_actors = [role for role in actors if actor_capacity(role) is not None]
-        best = max(
-            layouts(feasible_actors, rollouts),
-            key=lambda layout: (
-                min(actor_capacity(layout.actor), rollout_lower(layout.rollout)),
-                rollout_slo(layout.rollout, rate),
-                layout == current,
-            ),
-            default=None,
-        )
-        if best is None:
-            return result(None, "Selected GPU split has no placeable candidate")
-        current_bottleneck = min(
-            signal.actor_capacity or 0.0, current_rollout.lower or 0.0
-        )
-        best_bottleneck = min(actor_capacity(best.actor), rollout_lower(best.rollout))
-        if best != current and best_bottleneck <= current_bottleneck:
-            return result(
-                current,
-                "Selected GPU split does not improve bottleneck capacity; keeping current layout",
-            )
-        return result(best, "Selected GPU split misses demand; using its best capacity")
+        return result(current, "No feasible candidate improves the window score")

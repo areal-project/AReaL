@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, fields, replace
-from functools import lru_cache
 
 from .contracts import ActorConfig, Hardware, ModelShape, ParallelLayout, positive
 from .packing import DispatchConfig, Microbatch, plan_workload
@@ -595,7 +594,6 @@ class ExpertActorModel:
             )
         Operators(self.hardware, self.efficiency, dict(self.group_gbps))
 
-    @lru_cache(maxsize=512)
     def estimate_batch(self, config: ActorConfig, batch) -> ActorEstimate:
         return self.estimate(config, WorkloadStats.from_batch(batch))
 

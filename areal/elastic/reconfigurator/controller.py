@@ -179,10 +179,12 @@ def _placement(
 
 def _reconfiguration_model(
     parameters, models, place, warm_actor, warm_rollout
-) -> ReconfigurationModel | None:
+) -> ReconfigurationModel:
     stages = parameters.get("cutover_parameters")
     if not stages:
-        return None
+        raise ValueError(
+            "Elastic settings require cutover_parameters for the hardware and model"
+        )
     if any(stages[k] != parameters["profiles"][k] for k in ("hardware", "model")):
         raise ValueError(
             "Cutover parameters must match the hardware and model profiles"
@@ -245,7 +247,8 @@ def _policy(trainer, binding, warm_actor, warm_rollout, parameters, models):
         template,
         slo,
         batch_size=cfg.train_dataset.batch_size,
-        concurrency=cfg.rollout.max_concurrent_rollouts,
+        concurrency=cfg.rollout.max_concurrent_rollouts
+        or cfg.rollout.consumer_batch_size,
     )
     search = Optimizer(
         evaluator,

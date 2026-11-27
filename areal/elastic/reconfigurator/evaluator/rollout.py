@@ -545,7 +545,7 @@ def offered_fraction(forecast, rc, rollout_model, scheduler, slo, concurrency) -
     end = forecast.input_closes_at
     arrivals, waiting, active = deque(), {}, set()
     replicas = {i: _Replica() for i in range(rc.replicas)}
-    events, serial = [], count()
+    events, serial = [], count(len(offered))
     passed = 0
     routing_dirty = True
 
@@ -559,8 +559,16 @@ def offered_fraction(forecast, rc, rollout_model, scheduler, slo, concurrency) -
         request = Request(f"turn-{i}", turn.input_tokens, turn.output_tokens)
         waiting[key] = _Call(key, i, next(serial), at, request)
 
-    for key, at in offered.items():
-        push(at, "arrival", (key, at))
+    # Stable time order also preserves the original priority of simultaneous offers.
+    offers = enumerate(sorted(offered.items(), key=lambda item: item[1]))
+
+    def push_next_offer():
+        item = next(offers, None)
+        if item is not None:
+            index, (key, at) = item
+            heappush(events, (at, index, "arrival", (key, at)))
+
+    push_next_offer()
     push(end, "end")
 
     def simulate_step():
@@ -653,6 +661,7 @@ def offered_fraction(forecast, rc, rollout_model, scheduler, slo, concurrency) -
             _, _, kind, payload = heappop(events)
             if kind == "arrival":
                 arrivals.append(payload)
+                push_next_offer()
             elif kind == "tool":
                 add_call(*payload, now)
             elif kind == "tokens":
@@ -700,7 +709,9 @@ class RolloutCapacity:
         return self.lower if self.lower is not None else self.upper
 
 
-def probe_capacity(check, observed_rate, target, *, max_probes=4) -> RolloutCapacity:
+def probe_capacity(
+    check, observed_rate, target, *, max_probes=4, require_observed_rate=False
+) -> RolloutCapacity:
     started = perf_counter()
     lower = upper = None
     probes = []
@@ -708,7 +719,9 @@ def probe_capacity(check, observed_rate, target, *, max_probes=4) -> RolloutCapa
     for _ in range(max_probes):
         score = check(rate)
         probes.append((rate, score))
-        if score is None:
+        if score is None or (
+            require_observed_rate and len(probes) == 1 and score < target
+        ):
             break
         if score + 1e-12 >= target:
             lower = rate
@@ -724,17 +737,9 @@ def probe_capacity(check, observed_rate, target, *, max_probes=4) -> RolloutCapa
 
 
 def rollout_slo(pattern, rate, config, model, slo, concurrency) -> float:
-    """Replay a 60s workload sample in isolation at an offered rate."""
-    period = len(pattern.arrivals) / rate
-    scaled = replace(
-        pattern,
-        period_seconds=period,
-        arrivals=tuple(
-            (offset * period / pattern.period_seconds, family)
-            for offset, family in pattern.arrivals
-        ),
-    )
-    forecast = scaled.forecast(0.0, max(60.0, scaled.arrivals[0][0] + 1.0))
+    """Offer five concurrency windows of episodes at the requested mean rate."""
+    episode_count = 5 * concurrency
+    forecast = pattern.forecast(0.0, episode_count / rate, episode_count=episode_count)
     if forecast is None:
         raise ValueError("Capacity estimates require observed shapes for all families")
     forecast = replace(forecast, input_closes_at=forecast.input_closes_at + 75.0)

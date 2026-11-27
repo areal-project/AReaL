@@ -103,7 +103,7 @@ class LiveObservation:
                     key,
                     "online",
                     max(0.0, offered_at - self.origin),
-                    completed_at - self.origin if turns else None,
+                    completed_at - self.origin if completed_at is not None else None,
                     turns,
                     first["input_tokens"] if first else None,
                 )
