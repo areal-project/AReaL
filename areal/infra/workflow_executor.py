@@ -46,7 +46,7 @@ from areal.experimental.openai.types import (
     concat_tensor_interactions,
 )
 from areal.utils import logging, perf_tracer, stats_tracker
-from areal.infra.utils.concurrent import get_executor
+from areal.infra.utils.concurrent import get_executor, run_async_task
 from areal.utils.data import RolloutGroup, cycle_dataloader
 from areal.utils.perf_tracer import trace_perf, trace_session_event
 from logging import Logger
@@ -368,6 +368,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         deterministic_order: bool = False,
         consume_result: Callable[[TResult | None], TResult | None] | None = None,
         health_check: Callable[[], None] | None = None,
+        discard_result: Callable[[TResult | None], None] | None = None,
     ):
         self.runner = AsyncTaskRunner(
             max_queue_size=max_queue_size,
@@ -380,12 +381,15 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self.terminal_error_fn = terminal_error_fn
         self.deterministic_order = deterministic_order
         self.health_check = health_check
+        self.discard_result = discard_result
         self.logger: Logger
 
         # Unbounded deques for producer/consumer pattern
         self._pending_inputs: deque[TInput] = deque()
         self._pending_results: dict[int, TimedResult[TResult]] = {}
         self._active_task_ids: set[int] = set()
+        # Tasks whose consumer gave up before the result arrived; dropped on arrival.
+        self._abandoned_task_ids: set[int] = set()
 
         # Condition variables for coordination
         self._input_lock = threading.Lock()
@@ -435,6 +439,34 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         """Remove a registered callback for a task (e.g., on timeout)."""
         with self._result_cv:
             self._task_callbacks.pop(task_id, None)
+
+    def discard_task(self, task_id: int) -> None:
+        """Release a task whose consumer will never fetch its result.
+
+        A stored result is removed now. A result that is still running is dropped
+        by the fetch loop when it arrives, instead of being kept until shutdown.
+        Unknown or already-fetched task IDs are ignored.
+        """
+        discarded: TimedResult[TResult] | None = None
+        with self._result_cv:
+            self._task_callbacks.pop(task_id, None)
+            if task_id in self._pending_results:
+                discarded = self._pending_results.pop(task_id)
+            elif task_id in self._active_task_ids:
+                self._abandoned_task_ids.add(task_id)
+            self._active_task_ids.discard(task_id)
+            self._result_cv.notify_all()
+        if discarded is not None:
+            self._release_result(discarded.data)
+
+    def _release_result(self, result: TResult | None) -> None:
+        if self.discard_result is None:
+            return
+        try:
+            self.discard_result(result)
+        except Exception:
+            # Best-effort cleanup must not take down the dispatcher threads.
+            self.logger.warning("Failed to release a discarded result", exc_info=True)
 
     def _send_callback(self, addr: str, task_id: int, result: TResult):
         """Send task result to callback address (fire-and-forget)."""
@@ -507,14 +539,21 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 except TimeoutError:
                     continue
 
+                abandoned: list[TimedResult[TResult]] = []
                 with self._result_cv:
                     for result in results:
+                        if result.task_id in self._abandoned_task_ids:
+                            self._abandoned_task_ids.discard(result.task_id)
+                            abandoned.append(result)
+                            continue
                         self._pending_results[result.task_id] = result
                         # Trigger callback if registered
                         cb_addr = self._task_callbacks.get(result.task_id)
                         if cb_addr:
                             self._send_callback(cb_addr, result.task_id, result.data)
                     self._result_cv.notify_all()
+                for result in abandoned:
+                    self._release_result(result.data)
 
                 # Newly available capacity after result processing should wake producers
                 with self._input_cv:
@@ -579,6 +618,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
         # Clear pending callbacks to prevent memory leak
         self._task_callbacks.clear()
+        self._abandoned_task_ids.clear()
 
         # Shutdown the async task runner
         self.runner.destroy()
@@ -1269,6 +1309,7 @@ class WorkflowExecutor:
             enable_tracing=self.config.enable_rollout_tracing,
             terminal_error_fn=get_workflow_result_error,
             deterministic_order=getattr(self.config, "deterministic_sampling", False),
+            discard_result=self._release_discarded_result,
         )
 
         # Initialize the dispatcher's async task runner
@@ -1307,6 +1348,13 @@ class WorkflowExecutor:
             f"accepted: {stats.accepted}, "
             f"rejected: {stats.rejected}."
         )
+
+    def _release_discarded_result(self, result: WorkflowTaskResult | None) -> None:
+        """Clear remote shards of a result the controller abandoned."""
+        traj = getattr(result, "trajectory", None)
+        if traj is None:
+            return
+        run_async_task(self._clear_rejected_trajectory, traj)
 
     async def _clear_rejected_trajectory(self, traj: dict[str, Any] | None) -> None:
         """Best-effort cleanup for remote shards that will not reach training."""

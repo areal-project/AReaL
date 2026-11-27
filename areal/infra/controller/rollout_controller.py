@@ -65,6 +65,9 @@ from ..workflow_executor import (
 
 logger = logging.getLogger("RolloutController")
 
+# Bounds the best-effort RPC that drops a rollout result after a timeout or failure.
+_DISCARD_RESULT_TIMEOUT_SECONDS = 10.0
+
 
 def _merge_worker_stats(
     all_raw_stats: list[dict[str, float]],
@@ -1217,6 +1220,36 @@ class RolloutController:
             f"rejected: {stats.rejected}."
         )
 
+    async def _discard_worker_result(
+        self, submitted_to: tuple[Worker, str] | None, task_id: int | None
+    ) -> None:
+        """Tell a worker to drop a rollout result this controller gave up on.
+
+        Without this, a rollout that finishes after the controller stopped
+        waiting stays in the worker's result store until the worker exits.
+        """
+        if submitted_to is None or task_id is None:
+            return
+        worker, engine_name = submitted_to
+        try:
+            await asyncio.wait_for(
+                self.scheduler.async_call_engine(
+                    worker.id,
+                    "discard_rollout_result",
+                    engine_name=engine_name,
+                    task_id=task_id,
+                    http_timeout=_DISCARD_RESULT_TIMEOUT_SECONDS,
+                ),
+                timeout=_DISCARD_RESULT_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to discard abandoned rollout %s on worker %s: %s",
+                task_id,
+                worker.id,
+                exc,
+            )
+
     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
         async def _submit_then_wait() -> WorkflowTaskResult | None:
             # NOTE: No need to call `on_rollout_submitted` here.
@@ -1225,6 +1258,8 @@ class RolloutController:
             task_id = pending_task.task_id
 
             manager = self.staleness_manager
+            # Set once the task may exist on a worker, so a timeout or failure can release it.
+            submitted_to: tuple[Worker, str] | None = None
 
             try:
                 # Choose worker via round-robin.
@@ -1238,6 +1273,7 @@ class RolloutController:
                 proxy_addr = pending_task.proxy_addr
                 if self._proxy_started and proxy_addr is None:
                     proxy_addr = self.get_proxy_addr(rank)
+                submitted_to = (worker, engine_name)
                 engine_task_id = await self.scheduler.async_call_engine(
                     worker.id,
                     "submit",
@@ -1304,6 +1340,7 @@ class RolloutController:
                         self._pending_futures.pop(task_id, None)
                 manager.on_rollout_rejected()
                 logger.error(f"Rollout timed out after {self.config.request_timeout}s")
+                await self._discard_worker_result(submitted_to, task_id)
                 return None
             except Exception as exc:
                 if task_id is not None:
@@ -1311,6 +1348,7 @@ class RolloutController:
                         self._pending_futures.pop(task_id, None)
                 manager.on_rollout_rejected()
                 logger.error("Workflow execution failed: %s", exc, exc_info=True)
+                await self._discard_worker_result(submitted_to, task_id)
                 return None
 
         if pending_task.arena_stream_dataloader is None:
