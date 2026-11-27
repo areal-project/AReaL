@@ -91,6 +91,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger("RLTrainer")
 
 
+def _requires_reference_model(config: PPOConfig) -> bool:
+    """Return whether training needs to construct and score a reference model."""
+    return config.ref is not None and (
+        config.actor.kl_ctl > 0 or config.actor.use_kl_loss
+    )
+
+
 def _collect_trainable_rollout_batch(
     prepare_batch: Callable[[], list[dict[str, Any]]],
     *,
@@ -269,7 +276,7 @@ class PPOTrainer:
         requires_ref = (
             self.mopd_execution_plan.requires_ref
             if self.mopd_execution_plan is not None
-            else config.actor.kl_ctl > 0 and config.ref is not None
+            else _requires_reference_model(config)
         )
         self._should_offload_critic = bool(
             requires_critic and config.critic is not None and config.critic.offload
@@ -1546,7 +1553,12 @@ class PPOTrainer:
                     ModelAllocation.from_str(self.config.critic.backend, name="critic"),
                 )
             )
-        if self.config.actor.kl_ctl > 0 and self.config.ref is not None:
+        requires_ref = (
+            self.mopd_execution_plan.requires_ref
+            if self.mopd_execution_plan is not None
+            else _requires_reference_model(self.config)
+        )
+        if requires_ref and self.config.ref is not None:
             engine_cfgs.append(
                 (
                     self.config.ref,
