@@ -56,3 +56,33 @@ python3 examples/math/gsm8k_rl.py --config <megatron_config.yaml> \
     cluster.n_nodes=4 cluster.n_gpus_per_node=8 actor.path=Qwen/Qwen3-30B-A3B \
     actor.megatron.use_deterministic_algorithms=True
 ```
+
+## Score Centering
+
+推理与训练对同一个 token 的判断一旦分叉——精度不同、MoE 路由不同，或 rollout 权重落后于最新权重——采样器给出的 log-prob 就不再是 actor
+实际打分的分布。Score Centering（SC）在逐 token 的 REINFORCE loss 上叠加一个 detached 的 head/tail
+居中项，使梯度始终锚定在采样器分布上，而不随 policy 漂移；`sc_loss_mode=ppo_additive` 则保留带裁剪的 PPO
+surrogate，只叠加该校正项。
+
+```yaml
+actor:
+    use_score_centering: true
+gconfig:
+    score_centering_top_k: 4
+```
+
+采样 head 由 vLLM rollout 后端采集，因此 SC 需要 `rollout.backend=vllm:...`，且采样必须无截断：temperature
+1、`top_p=1`、`top_k=-1`、无 frequency penalty，不使用 greedy 或 beam search。SC 自己负责 head 加权，因此
+`actor.rejection_sampling` 与 `actor.importance_sampling` 需保持未设置，加权方式由 `actor.sc_mode`
+选择（默认 `none`，可选 `tis` 或 `mis`，配合 `sc_clip_low`/`sc_clip_high`）。`actor.recompute_logprob`
+必须保持 `False`。树训练、critic actor、MTP 训练、chunked logits，以及 SAPO/CISPO 与 decoupled/M2PO
+loss，都会在配置加载时被拒绝。
+
+Megatron actor 可在数据、张量、流水与专家并行下对这些 head 打分；FSDP actor 则要求 `sp_size == tp_size == 1`。
+
+`score_centering_top_k` 是每个 token 保留的 head 数量（`1..1024`）；当 `rollout.vllm.max_logprobs`
+更小时会自动上调。在 Qwen3-30B-A3B MoE 实测中，`k=4` 未观察到墙钟开销，额外传输约 0.4 MB/步。
+
+校正项记为 `sc_correction` 与 `sc_loss_term`，旁边是 `sc_rho`——采样器与 trainer 在 top-k
+之外的尾部概率质量之比。两者一致时为 1.0，漂移越大取值越大，因此开启前先读它：约 1.5 到 2 以上且 `kl_div_direct` 在 0.05
+以上时，说明存在值得校正的漂移；接近 1.0 则表示没有可校正的内容。

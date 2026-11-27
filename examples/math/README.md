@@ -84,8 +84,8 @@ weights, so the sampled term is not weighted twice. Diagnostics are exported as
 `sc_q_mass` and `sc_p_mass`.
 
 Support requires the vLLM rollout backend, temperature 1, untruncated sampling and no
-penalties. Megatron actors accept data, tensor, pipeline and context parallelism; FSDP
-actors still require `sp_size == tp_size == 1`, because the injected trainer logits
-there are a local slice. SAPO/CISPO, decoupled PPO, tree training and distillation
-remain unsupported, and `score_centering_top_k` never reaches the OpenAI SDK (the proxy
-consumes it).
+frequency penalty. Megatron actors accept data, tensor, pipeline and expert parallelism;
+FSDP actors still require `sp_size == tp_size == 1`, because the injected trainer logits
+there are a local slice. Context parallelism is not covered yet. SAPO/CISPO, decoupled
+PPO, tree training and distillation remain unsupported, and `score_centering_top_k`
+never reaches the OpenAI SDK (the proxy consumes it).
