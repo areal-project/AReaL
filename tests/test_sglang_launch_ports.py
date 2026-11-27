@@ -246,3 +246,33 @@ def test_masked_dspark_launch_selects_native_worker(monkeypatch, installed):
         launch.call_args.kwargs["env"]["SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"]
         == "0"
     )
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "top_k", "memory_saver", "configured_backup", "expected"),
+    [
+        ("DSPARK", None, True, False, True),
+        ("DSPARK", 50, True, False, True),
+        ("DSPARK", 50, False, False, False),
+        (None, None, True, False, False),
+        ("EAGLE", None, True, True, True),
+    ],
+)
+def test_draft_backup_in_server_command(
+    monkeypatch, algorithm, top_k, memory_saver, configured_backup, expected
+):
+    from areal.engine import sglang_sampling_mask_plugin as plugin
+
+    monkeypatch.setattr(plugin, "version", lambda name: "0.5.20")
+    launch = MagicMock()
+    monkeypatch.setattr(sglang_remote.subprocess, "Popen", launch)
+    sglang_remote.SGLangBackend().launch_server(
+        dict(
+            nccl_port=19001,
+            speculative_algorithm=algorithm,
+            _sampling_mask_top_k=top_k,
+            enable_memory_saver=memory_saver,
+            enable_draft_weights_cpu_backup=configured_backup,
+        )
+    )
+    assert ("--enable-draft-weights-cpu-backup" in launch.call_args.args[0]) == expected

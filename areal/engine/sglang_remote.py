@@ -661,10 +661,12 @@ class SGLangBackend:
         server_args.pop("_sampling_mask_retained_versions", None)
         if sampling_mask_top_k is not None:
             server_args["skip_server_warmup"] = True
-        joint_dspark = (
-            sampling_mask_top_k is not None
-            and server_args.get("speculative_algorithm") == "DSPARK"
-        )
+        dspark = server_args.get("speculative_algorithm") == "DSPARK"
+        if dspark and server_args.get("enable_memory_saver"):
+            # The actor refreshes target weights only. Preserve the frozen draft
+            # when SGLang releases its weight allocations between rollouts.
+            server_args["enable_draft_weights_cpu_backup"] = True
+        joint_dspark = sampling_mask_top_k is not None and dspark
         if joint_dspark:
             from areal.engine.sglang_sampling_mask_plugin import (
                 JOINT_DSPARK,
