@@ -6,10 +6,10 @@ import asyncio
 from collections.abc import Mapping
 from typing import Any
 
-from areal.infra.sandbox._opensandbox_session import (
+from areal.infra.sandbox import (
     DEFAULT_TTL_SECONDS,
     OpenSandboxSession,
-    _load_opensandbox_sdk,
+    load_opensandbox_sdk,
 )
 from areal.utils import logging
 
@@ -50,7 +50,7 @@ class OpenSandboxPythonTool(BaseTool):
         create_timeout: float = 120.0,
     ):
         super().__init__(timeout, debug_mode)
-        self._errors = _load_opensandbox_sdk()
+        self._errors = load_opensandbox_sdk()
         self._session = OpenSandboxSession(
             image=image,
             snapshot_id=snapshot_id,

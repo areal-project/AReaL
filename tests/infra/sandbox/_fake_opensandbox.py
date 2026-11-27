@@ -2,16 +2,19 @@
 
 """An in-memory fake of the ``opensandbox`` SDK for offline tests.
 
-``install`` registers fake modules under the ``opensandbox`` package names,
-so the lazy loader in ``_opensandbox_session`` imports them without the real
-dependency. The fake sandbox records what was created and answers command
-runs from a scriptable queue of results.
+``install`` registers fake modules under the ``opensandbox`` package names
+through pytest's ``monkeypatch``, so the lazy loader in
+``_opensandbox_session`` imports them without the real dependency and pytest
+restores both ``sys.modules`` and the loader cache at teardown. The fake
+sandbox records what was created and answers command runs from a scriptable
+queue of results.
 """
 
 from __future__ import annotations
 
 import sys
 import types
+from dataclasses import dataclass
 from datetime import timedelta
 
 MODULE_NAMES = (
@@ -30,6 +33,11 @@ class FakeSandboxException(Exception):
 
 
 class FakeConnectionConfig:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class FakeConnectionConfigSync:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
 
@@ -86,6 +94,8 @@ class _Files:
         self._state = state
 
     def write(self, path, data):
+        if self._state.write_errors:
+            raise self._state.write_errors.pop(0)
         self._state.files[path] = data
 
     def delete(self, paths):
@@ -176,6 +186,7 @@ class FakeOpensandboxState:
         self.executed_commands: list[list[str]] = []
         self.last_opts = None
         self.files: dict[str, str] = {}
+        self.write_errors: list[Exception] = []
         self.destroyed_ids: list[str] = []
         self.sandbox_counter = 0
         self.sandboxes: list[FakeSandboxBase] = []
@@ -213,6 +224,7 @@ class FakeOpensandboxState:
 
 def _build_modules(state: FakeOpensandboxState) -> dict[str, types.ModuleType]:
     import importlib.machinery
+
     async def async_create(**kwargs):
         if state.create_delays:
             import asyncio
@@ -235,6 +247,7 @@ def _build_modules(state: FakeOpensandboxState) -> dict[str, types.ModuleType]:
 
     config_module = types.ModuleType("opensandbox.config")
     config_module.ConnectionConfig = FakeConnectionConfig
+    config_module.ConnectionConfigSync = FakeConnectionConfigSync
 
     exceptions_module = types.ModuleType("opensandbox.exceptions")
     exceptions_module.SandboxException = FakeSandboxException
@@ -263,36 +276,34 @@ def _build_modules(state: FakeOpensandboxState) -> dict[str, types.ModuleType]:
     return modules
 
 
+@dataclass
 class InstalledFake:
-    def __init__(self, state: FakeOpensandboxState, saved: dict):
-        self.state = state
-        self._saved = saved
+    """Handle returned by ``install``; teardown is owned by ``monkeypatch``."""
 
-    def uninstall(self):
-        for name in MODULE_NAMES:
-            if name in self._saved and self._saved[name] is not None:
-                sys.modules[name] = self._saved[name]
-            else:
-                sys.modules.pop(name, None)
+    state: FakeOpensandboxState
 
 
 def install(monkeypatch) -> InstalledFake:
-    """Install the fake modules into ``sys.modules`` and reset the loader cache."""
+    """Install the fake modules into ``sys.modules`` and reset the loader cache.
+
+    Everything is registered through ``monkeypatch`` so pytest restores the
+    original modules and cached SDK classes even if a test fails.
+    """
     import areal.infra.sandbox._opensandbox_session as session_module
 
-    saved = {name: sys.modules.get(name) for name in MODULE_NAMES}
     for name in MODULE_NAMES:
-        sys.modules.pop(name, None)
+        monkeypatch.delitem(sys.modules, name, raising=False)
     state = FakeOpensandboxState()
     for name, module in _build_modules(state).items():
-        sys.modules[name] = module
+        monkeypatch.setitem(sys.modules, name, module)
     for name in (
         "Sandbox",
         "SandboxSync",
         "RunCommandOpts",
         "NetworkPolicy",
         "ConnectionConfig",
+        "ConnectionConfigSync",
         "SandboxException",
     ):
         monkeypatch.setattr(session_module, name, None)
-    return InstalledFake(state, saved)
+    return InstalledFake(state)

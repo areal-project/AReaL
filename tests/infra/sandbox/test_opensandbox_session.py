@@ -8,24 +8,26 @@ from datetime import timedelta
 
 import pytest
 
-import areal.infra.sandbox._opensandbox_session as session_module
 from tests.infra.sandbox._fake_opensandbox import (
+    FakeConnectionConfig,
     FakeExecution,
     FakeExecutionError,
     FakeSandboxException,
     install,
 )
 
+import areal.infra.sandbox._opensandbox_session as session_module
+
 
 @pytest.fixture
 def fake_sdk(monkeypatch):
-    fake = install(monkeypatch)
-    yield fake
-    fake.uninstall()
+    return install(monkeypatch)
 
 
 def _repl_payload(stdout="", error=None):
-    return FakeExecution(stdout=json.dumps({"stdout": stdout, "stderr": "", "error": error}), exit_code=0)
+    return FakeExecution(
+        stdout=json.dumps({"stdout": stdout, "stderr": "", "error": error}), exit_code=0
+    )
 
 
 @pytest.mark.asyncio
@@ -81,7 +83,104 @@ async def test_session_connection_config_uses_explicit_credentials(fake_sdk):
     await session.arun_script("print('hi')", timeout=5)
 
     config = fake_sdk.state.create_calls[0]["connection_config"]
+    assert isinstance(config, FakeConnectionConfig)
     assert config.kwargs == {"api_key": "k", "domain": "d.example"}
+
+
+@pytest.mark.asyncio
+async def test_session_wires_create_timeout_to_ready_timeout(fake_sdk):
+    session = session_module.OpenSandboxSession(create_timeout=45)
+    await session.arun_script("print('hi')", timeout=5)
+
+    assert fake_sdk.state.create_calls[0]["ready_timeout"] == timedelta(seconds=45)
+
+
+@pytest.mark.asyncio
+async def test_session_default_timeout_used_when_none(fake_sdk):
+    session = session_module.OpenSandboxSession(default_timeout=7)
+    fake_sdk.state.queue_execution(FakeExecution(stdout="hi\n", exit_code=0))
+
+    result = await session.arun_script("print('hi')")
+
+    assert result.exit_code == 0
+    # The exec-level timeout is the backstop beyond the in-sandbox one.
+    assert fake_sdk.state.last_opts.timeout == timedelta(seconds=7 + 15)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runs_create_one_sandbox(fake_sdk):
+    fake_sdk.state.create_delays = [0.05, 0.05]
+    fake_sdk.state.queue_execution(FakeExecution(stdout="a\n", exit_code=0))
+    fake_sdk.state.queue_execution(FakeExecution(stdout="b\n", exit_code=0))
+    session = session_module.OpenSandboxSession()
+
+    results = await asyncio.gather(
+        session.arun_script("print('a')", timeout=5),
+        session.arun_script("print('b')", timeout=5),
+    )
+
+    assert [r.stdout for r in results] == ["a", "b"]
+    assert len(fake_sdk.state.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_arun_script_recreates_when_write_file_reports_gone(fake_sdk):
+    session = session_module.OpenSandboxSession()
+    sandbox = await session.astart()
+    fake_sdk.state.write_errors.append(FakeSandboxException("not found"))
+    sandbox.get_info_results.append(FakeSandboxException("not found"))
+    fake_sdk.state.queue_execution(FakeExecution(stdout="ok\n", exit_code=0))
+
+    result = await session.arun_script("print('ok')", timeout=5)
+
+    assert result.stdout == "ok"
+    assert len(fake_sdk.state.create_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_arun_cell_recreates_when_repl_write_reports_gone(fake_sdk):
+    session = session_module.OpenSandboxSession()
+    sandbox = await session.astart()
+    fake_sdk.state.write_errors.append(FakeSandboxException("not found"))
+    sandbox.get_info_results.append(FakeSandboxException("not found"))
+    fake_sdk.state.queue_execution(FakeExecution(stdout="0\n", exit_code=0))
+
+    result = await session.arun_cell("x = 1", timeout=5)
+
+    # The cell was never delivered; the result reports the state loss and a
+    # fresh sandbox with a fresh interpreter is already running.
+    assert result.error is not None
+    assert "no longer exists" in result.error.value
+    assert len(fake_sdk.state.create_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_arun_cell_sends_small_cells_on_argv(fake_sdk):
+    session = session_module.OpenSandboxSession()
+    fake_sdk.state.queue_execution(FakeExecution(stdout="0\n", exit_code=0))
+    fake_sdk.state.queue_execution(_repl_payload("2\n"))
+
+    result = await session.arun_cell("print(2)", timeout=5)
+
+    assert result.stdout == "2\n"
+    assert not fake_sdk.state.executed_commands[-1][-1].startswith("@")
+
+
+@pytest.mark.asyncio
+async def test_arun_cell_sends_large_cells_via_file(fake_sdk, monkeypatch):
+    monkeypatch.setattr(session_module, "_MAX_INLINE_CELL_CHARS", 8)
+    session = session_module.OpenSandboxSession()
+    fake_sdk.state.queue_execution(FakeExecution(stdout="0\n", exit_code=0))
+    fake_sdk.state.queue_execution(_repl_payload("done\n"))
+
+    result = await session.arun_cell("print('a large cell payload')", timeout=5)
+
+    assert result.stdout == "done\n"
+    call_command = fake_sdk.state.executed_commands[-1]
+    assert call_command[-1].startswith("@/tmp/.areal-sandbox/cell-")
+    assert call_command[-1].endswith(".b64")
+    # The transfer file is cleaned up after the call.
+    assert not [p for p in fake_sdk.state.files if "cell-" in p]
 
 
 @pytest.mark.asyncio
@@ -107,9 +206,7 @@ async def test_arun_script_returns_stdout_and_exit_code(fake_sdk):
     assert result.stdout == "hi"
     # The code file was removed again after the run.
     written = [
-        p
-        for p in fake_sdk.state.files
-        if p.startswith("/tmp/.areal-sandbox/code-")
+        p for p in fake_sdk.state.files if p.startswith("/tmp/.areal-sandbox/code-")
     ]
     assert written == []
 
@@ -214,7 +311,9 @@ async def test_arun_cell_keeps_state_across_calls(fake_sdk):
 async def test_arun_cell_reports_restarted_interpreter(fake_sdk):
     session = session_module.OpenSandboxSession()
     fake_sdk.state.queue_execution(FakeExecution(stdout="0\n", exit_code=0))  # start
-    fake_sdk.state.queue_execution(FakeExecution(stderr="crashed\n", exit_code=1))  # call
+    fake_sdk.state.queue_execution(
+        FakeExecution(stderr="crashed\n", exit_code=1)
+    )  # call
     fake_sdk.state.queue_execution(FakeExecution(stdout="0\n", exit_code=0))  # restart
 
     result = await session.arun_cell("x = 1", timeout=5)

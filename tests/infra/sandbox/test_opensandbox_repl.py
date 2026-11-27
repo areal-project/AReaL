@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -24,7 +25,8 @@ import pytest
 from areal.infra.sandbox._opensandbox_repl import call
 
 pytestmark = pytest.mark.skipif(
-    not sys.platform.startswith("linux"), reason="uses AF_UNIX and SIGALRM"
+    os.name != "posix" or not hasattr(signal, "SIGALRM"),
+    reason="uses AF_UNIX sockets and SIGALRM",
 )
 
 

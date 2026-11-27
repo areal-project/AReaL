@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
 
@@ -17,15 +18,17 @@ from tests.infra.sandbox._fake_opensandbox import (
 )
 
 
+def _has_opensandbox_sdk() -> bool:
+    return importlib.util.find_spec("opensandbox") is not None
+
+
 def _has_opensandbox_endpoint() -> bool:
-    return bool(os.environ.get("OPEN_SANDBOX_DOMAIN"))
+    return _has_opensandbox_sdk() and bool(os.environ.get("OPEN_SANDBOX_DOMAIN"))
 
 
 @pytest.fixture
 def fake_sdk(monkeypatch):
-    fake = install(monkeypatch)
-    yield fake
-    fake.uninstall()
+    return install(monkeypatch)
 
 
 def _queue_cell(fake_sdk, stdout="", error=None, exit_code=0):
@@ -87,7 +90,7 @@ async def test_tool_formats_cell_error(fake_sdk):
     error = {
         "name": "ValueError",
         "value": "x",
-        "traceback": 'Traceback (most recent call last):\nValueError: x\n',
+        "traceback": "Traceback (most recent call last):\nValueError: x\n",
     }
     _queue_cell(fake_sdk, error=error)
     tool = OpenSandboxPythonTool()

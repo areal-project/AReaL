@@ -21,13 +21,14 @@ import signal
 import socket
 import sys
 import traceback
+from typing import Any
 
 
-def _on_alarm(signum, frame):
+def _on_alarm(signum: int, frame: Any) -> None:
     raise TimeoutError("Execution timed out")
 
 
-def _recv_all(conn):
+def _recv_all(conn: socket.socket) -> bytes:
     chunks = []
     while True:
         data = conn.recv(65536)
@@ -37,7 +38,7 @@ def _recv_all(conn):
     return b"".join(chunks)
 
 
-def _run_cell(namespace, code, timeout):
+def _run_cell(namespace: dict[str, Any], code: str, timeout: float) -> dict[str, Any]:
     stdout = io.StringIO()
     stderr = io.StringIO()
     error = None
@@ -61,7 +62,7 @@ def _run_cell(namespace, code, timeout):
     return {"stdout": stdout.getvalue(), "stderr": stderr.getvalue(), "error": error}
 
 
-def serve(path):
+def serve(path: str) -> None:
     if os.path.exists(path):
         os.unlink(path)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -95,7 +96,7 @@ def serve(path):
                 pass
 
 
-def call(path, timeout, code_arg):
+def call(path: str, timeout: str, code_arg: str) -> None:
     if code_arg.startswith("@"):
         with open(code_arg[1:], encoding="utf-8") as f:
             code_arg = f.read()

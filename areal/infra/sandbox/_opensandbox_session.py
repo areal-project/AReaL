@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import json
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -45,22 +47,35 @@ DEFAULT_TTL_SECONDS = 3600
 # fires first and reports a clean result.
 _EXEC_GRACE_SECONDS = 15.0
 _CREATE_ATTEMPTS_CANCEL_WAIT = 30.0
+# Linux execve rejects any single argument longer than MAX_ARG_STRLEN
+# (128 KiB), and the cell travels base64-encoded. Keep smaller cells on argv
+# and move larger ones through a file (the REPL's ``@PATH`` mode) so a big
+# cell cannot be misread as a crashed interpreter.
+_MAX_INLINE_CELL_CHARS = 64 * 1024
 
 Sandbox = None
 SandboxSync = None
 RunCommandOpts = None
 NetworkPolicy = None
 ConnectionConfig = None
+ConnectionConfigSync = None
 SandboxException = None
 
 
-def _load_opensandbox_sdk() -> dict[str, Any]:
+def load_opensandbox_sdk() -> dict[str, Any]:
     global Sandbox, SandboxSync, RunCommandOpts, NetworkPolicy, ConnectionConfig
-    global SandboxException
+    global ConnectionConfigSync, SandboxException
 
     if all(
         value is not None
-        for value in (Sandbox, SandboxSync, RunCommandOpts, NetworkPolicy, ConnectionConfig)
+        for value in (
+            Sandbox,
+            SandboxSync,
+            RunCommandOpts,
+            NetworkPolicy,
+            ConnectionConfig,
+            ConnectionConfigSync,
+        )
     ):
         return {
             "Sandbox": Sandbox,
@@ -68,12 +83,16 @@ def _load_opensandbox_sdk() -> dict[str, Any]:
             "RunCommandOpts": RunCommandOpts,
             "NetworkPolicy": NetworkPolicy,
             "ConnectionConfig": ConnectionConfig,
+            "ConnectionConfigSync": ConnectionConfigSync,
             "SandboxException": SandboxException,
         }
 
     try:
         from opensandbox import Sandbox as ImportedSandbox
         from opensandbox.config import ConnectionConfig as ImportedConnectionConfig
+        from opensandbox.config import (
+            ConnectionConfigSync as ImportedConnectionConfigSync,
+        )
         from opensandbox.exceptions import (
             SandboxException as ImportedSandboxException,
         )
@@ -82,8 +101,8 @@ def _load_opensandbox_sdk() -> dict[str, Any]:
         from opensandbox.sync import SandboxSync as ImportedSandboxSync
     except ImportError as exc:
         raise ImportError(
-            "OpenSandboxRunner requires the optional 'opensandbox' dependency. "
-            "Install it with `uv sync --extra sandbox`."
+            "The OpenSandbox backend requires the optional 'opensandbox' "
+            "dependency. Install it with `uv sync --extra sandbox`."
         ) from exc
 
     Sandbox = ImportedSandbox
@@ -91,6 +110,7 @@ def _load_opensandbox_sdk() -> dict[str, Any]:
     RunCommandOpts = ImportedRunCommandOpts
     NetworkPolicy = ImportedNetworkPolicy
     ConnectionConfig = ImportedConnectionConfig
+    ConnectionConfigSync = ImportedConnectionConfigSync
     SandboxException = ImportedSandboxException
 
     return {
@@ -99,8 +119,95 @@ def _load_opensandbox_sdk() -> dict[str, Any]:
         "RunCommandOpts": RunCommandOpts,
         "NetworkPolicy": NetworkPolicy,
         "ConnectionConfig": ConnectionConfig,
+        "ConnectionConfigSync": ConnectionConfigSync,
         "SandboxException": SandboxException,
     }
+
+
+@dataclass
+class OpenSandboxConfig:
+    """Creation settings shared by the sync runner and the async session.
+
+    ``__post_init__`` holds the single source of truth for validation and
+    defaulting (default image, ``DEFAULT_METADATA`` merging), so both entry
+    points cannot drift apart.
+    """
+
+    image: str | None = None
+    snapshot_id: str | None = None
+    cpu: str | None = None
+    memory: str | None = None
+    env_vars: Mapping[str, str] = field(default_factory=dict)
+    metadata: Mapping[str, str] = field(default_factory=dict)
+    network_block_all: bool = False
+    ttl_seconds: int | None = DEFAULT_TTL_SECONDS
+    api_key: str | None = None
+    domain: str | None = None
+    # Budget for the SDK's create call: endpoint publication plus health
+    # checks before the sandbox is reported ready.
+    create_timeout: float = 120.0
+    # Per-run code timeout used when the caller does not pass one.
+    default_timeout: int = 30
+
+    def __post_init__(self) -> None:
+        if self.image is None and self.snapshot_id is None:
+            self.image = "python:3.11"
+        if self.image is not None and self.snapshot_id is not None:
+            raise ValueError("Pass either image or snapshot_id, not both")
+        if self.ttl_seconds is not None and self.ttl_seconds <= 0:
+            raise ValueError(
+                f"ttl_seconds must be positive or None, got {self.ttl_seconds}"
+            )
+        self.env_vars = dict(self.env_vars)
+        self.metadata = {**DEFAULT_METADATA, **self.metadata}
+
+    def build_create_kwargs(self, sdk: dict[str, Any], *, sync: bool) -> dict[str, Any]:
+        """Arguments for the async or sync SDK create entry point."""
+        config_cls = sdk["ConnectionConfigSync"] if sync else sdk["ConnectionConfig"]
+        connection_kwargs: dict[str, Any] = {}
+        if self.api_key is not None:
+            connection_kwargs["api_key"] = self.api_key
+        if self.domain is not None:
+            connection_kwargs["domain"] = self.domain
+
+        kwargs: dict[str, Any] = {
+            "env": dict(self.env_vars) or None,
+            "metadata": dict(self.metadata) or None,
+            "connection_config": config_cls(**connection_kwargs),
+            "ready_timeout": timedelta(seconds=self.create_timeout),
+        }
+        if self.image is not None:
+            kwargs["image"] = self.image
+        else:
+            kwargs["snapshot_id"] = self.snapshot_id
+        resource: dict[str, str] = {}
+        if self.cpu is not None:
+            resource["cpu"] = self.cpu
+        if self.memory is not None:
+            resource["memory"] = self.memory
+        if resource:
+            kwargs["resource"] = resource
+        if self.ttl_seconds is not None:
+            kwargs["timeout"] = timedelta(seconds=self.ttl_seconds)
+        if self.network_block_all:
+            kwargs["network_policy"] = sdk["NetworkPolicy"](
+                default_action="deny", egress=[]
+            )
+        return kwargs
+
+
+class _OpenSandboxHandle:
+    """State and helpers shared by the sync runner and the async session."""
+
+    def __init__(self, config: OpenSandboxConfig, sdk: dict[str, Any]) -> None:
+        self.config = config
+        self._sdk = sdk
+        self.sandbox_id: str | None = None
+        self._sandbox: Any = None
+
+    def _forget(self) -> None:
+        self._sandbox = None
+        self.sandbox_id = None
 
 
 @dataclass
@@ -126,7 +233,7 @@ class OpenSandboxExecResult:
     error: str | None = None
 
 
-class OpenSandboxSession:
+class OpenSandboxSession(_OpenSandboxHandle):
     """Owns one OpenSandbox sandbox.
 
     The sandbox is created with a server-side TTL (``ttl_seconds``). If this
@@ -151,97 +258,85 @@ class OpenSandboxSession:
         create_timeout: float = 120.0,
         default_timeout: int = 30,
     ):
-        if image is None and snapshot_id is None:
-            image = "python:3.11"
-        if image is not None and snapshot_id is not None:
-            raise ValueError("Pass either image or snapshot_id, not both")
-        if ttl_seconds is not None and ttl_seconds <= 0:
-            raise ValueError(f"ttl_seconds must be positive or None, got {ttl_seconds}")
-        self._sdk = _load_opensandbox_sdk()
-        self.image = image
-        self.snapshot_id = snapshot_id
-        self.cpu = cpu
-        self.memory = memory
-        self.env_vars = dict(env_vars or {})
-        self.metadata = {**DEFAULT_METADATA, **(metadata or {})}
-        self.network_block_all = network_block_all
-        self.ttl_seconds = ttl_seconds
-        self.api_key = api_key
-        self.domain = domain
-        self.create_timeout = create_timeout
-        self.default_timeout = default_timeout
-        self.sandbox_id: str | None = None
-        self._sandbox = None
-        self._repl_started = False
-        self._lock = asyncio.Lock()
-
-    def _build_create_kwargs(self) -> dict[str, Any]:
-        return build_create_kwargs(
-            self._sdk,
-            image=self.image,
-            snapshot_id=self.snapshot_id,
-            cpu=self.cpu,
-            memory=self.memory,
-            env_vars=self.env_vars,
-            metadata=self.metadata,
-            network_block_all=self.network_block_all,
-            ttl_seconds=self.ttl_seconds,
-            api_key=self.api_key,
-            domain=self.domain,
+        config = OpenSandboxConfig(
+            image=image,
+            snapshot_id=snapshot_id,
+            cpu=cpu,
+            memory=memory,
+            env_vars=env_vars or {},
+            metadata=metadata or {},
+            network_block_all=network_block_all,
+            ttl_seconds=ttl_seconds,
+            api_key=api_key,
+            domain=domain,
+            create_timeout=create_timeout,
+            default_timeout=default_timeout,
         )
+        super().__init__(config, load_opensandbox_sdk())
+        self._repl_started = False
+        # One lock per concern: ``_lock`` serializes interpreter cells,
+        # ``_start_lock`` serializes sandbox creation (they must not nest).
+        self._start_lock = asyncio.Lock()
+        self._lock = asyncio.Lock()
 
     async def astart(self) -> Any:
         """Create the sandbox and wait until it is ready."""
         if self._sandbox is not None:
             return self._sandbox
+        async with self._start_lock:
+            if self._sandbox is not None:
+                return self._sandbox
 
-        create = asyncio.ensure_future(
-            self._sdk["Sandbox"].create(**self._build_create_kwargs())
-        )
-        try:
-            sandbox = await asyncio.shield(create)
-        except asyncio.CancelledError:
-            # The create may still finish on the server. Wait for it briefly
-            # and delete the sandbox, so a cancelled rollout does not leave
-            # one behind on top of the TTL.
+            create = asyncio.ensure_future(
+                self._sdk["Sandbox"].create(
+                    **self.config.build_create_kwargs(self._sdk, sync=False)
+                )
+            )
             try:
-                sandbox = await asyncio.wait_for(
-                    asyncio.shield(create), timeout=_CREATE_ATTEMPTS_CANCEL_WAIT
-                )
-                self._sandbox = sandbox
-                self.sandbox_id = sandbox.id
-                await self.adelete()
-            except Exception as exc:
-                logger.warning(
-                    "Cleanup after a cancelled OpenSandbox create failed: %s", exc
-                )
-            raise
+                sandbox = await asyncio.shield(create)
+            except asyncio.CancelledError:
+                # The create may still finish on the server. Wait for it
+                # briefly and delete the sandbox, so a cancelled rollout does
+                # not leave one behind on top of the TTL.
+                try:
+                    sandbox = await asyncio.wait_for(
+                        asyncio.shield(create), timeout=_CREATE_ATTEMPTS_CANCEL_WAIT
+                    )
+                    self._sandbox = sandbox
+                    self.sandbox_id = sandbox.id
+                    await self.adelete()
+                except Exception as exc:
+                    logger.warning(
+                        "Cleanup after a cancelled OpenSandbox create failed: %s", exc
+                    )
+                raise
 
-        self._sandbox = sandbox
-        self.sandbox_id = sandbox.id
-        logger.debug("Created OpenSandbox sandbox %s", sandbox.id)
-        return sandbox
+            self._sandbox = sandbox
+            self.sandbox_id = sandbox.id
+            logger.debug("Created OpenSandbox sandbox %s", sandbox.id)
+            return sandbox
 
-    async def _aexec(self, command: list[str], *, timeout: float) -> OpenSandboxExecResult:
+    async def _aexec(
+        self, command: list[str], *, timeout: float
+    ) -> OpenSandboxExecResult:
         sandbox = await self.astart()
         run_command_opts = self._sdk["RunCommandOpts"]
-        opts = run_command_opts(timeout=timedelta_of(timeout))
+        opts = run_command_opts(timeout=timedelta(seconds=timeout))
         try:
             execution = await sandbox.commands.run(command, opts=opts)
         except self._sdk["SandboxException"] as exc:
-            if await self._ais_gone(exc):
+            if await self._ais_gone():
                 raise _SandboxGoneError(str(exc)) from exc
             raise
         return _to_exec_result(execution)
 
-    async def _ais_gone(self, exc: Exception) -> bool:
-        """Probe the sandbox after a failed exec.
+    async def _ais_gone(self) -> bool:
+        """Probe the sandbox after a failed SDK call.
 
         Returns True when the sandbox no longer exists or has reached a
         terminal state, so the caller can recreate it and run the command
-        again. The failed exec never ran code in that case.
+        again. The failed call never delivered any effect in that case.
         """
-        del exc
         sandbox = self._sandbox
         if sandbox is None:
             return False
@@ -264,11 +359,12 @@ class OpenSandboxSession:
         return False
 
     def _forget(self) -> None:
-        self._sandbox = None
-        self.sandbox_id = None
+        super()._forget()
         self._repl_started = False
 
-    async def arun(self, command: list[str], *, timeout: float) -> OpenSandboxExecResult:
+    async def arun(
+        self, command: list[str], *, timeout: float
+    ) -> OpenSandboxExecResult:
         """Run a command in the sandbox.
 
         Raises ``_SandboxGoneError`` when the sandbox no longer exists, so the
@@ -277,7 +373,9 @@ class OpenSandboxSession:
         """
         return await self._aexec(command, timeout=timeout)
 
-    async def arun_script(self, code: str, *, timeout: float) -> OpenSandboxExecResult:
+    async def arun_script(
+        self, code: str, *, timeout: float | None = None
+    ) -> OpenSandboxExecResult:
         """Run ``code`` in a fresh Python process.
 
         Exit code 124 means the code ran past ``timeout`` and was killed. The
@@ -286,6 +384,8 @@ class OpenSandboxSession:
         passed), the code runs in a new one: the failed attempt never
         delivered the code, so rerunning it is safe.
         """
+        if timeout is None:
+            timeout = self.config.default_timeout
         _check_timeout(timeout)
         script_path = f"{SANDBOX_DIR}/code-{uuid.uuid4().hex}.py"
         try:
@@ -298,20 +398,30 @@ class OpenSandboxSession:
     async def _run_script_once(
         self, script_path: str, code: str, *, timeout: float
     ) -> OpenSandboxExecResult:
-        sandbox = await self.astart()
-        await sandbox.files.write_file(script_path, code)
+        await self._awrite_file(script_path, code)
         try:
-            command = [
-                "timeout",
-                "-k",
-                "2",
-                str(timeout),
-                PYTHON_BIN,
-                script_path,
-            ]
-            return await self.arun(command, timeout=timeout + _EXEC_GRACE_SECONDS)
+            return await self.arun(
+                _script_command(script_path, timeout),
+                timeout=timeout + _EXEC_GRACE_SECONDS,
+            )
         finally:
             await self._aremove(script_path)
+
+    async def _awrite_file(self, path: str, data: str) -> None:
+        """Write a file, turning a vanished sandbox into ``_SandboxGoneError``.
+
+        ``files.write_file`` is the first SDK call of every run and cell, so
+        without this guard a sandbox that expired between calls fails with a
+        raw ``SandboxException`` instead of taking the recreate-and-retry
+        path.
+        """
+        sandbox = await self.astart()
+        try:
+            await sandbox.files.write_file(path, data)
+        except self._sdk["SandboxException"] as exc:
+            if await self._ais_gone():
+                raise _SandboxGoneError(str(exc)) from exc
+            raise
 
     async def _aremove(self, path: str) -> None:
         sandbox = self._sandbox
@@ -324,10 +434,12 @@ class OpenSandboxSession:
 
     async def _arenew_lease(self) -> None:
         """Best-effort lease renewal; expiry still reaps a lost sandbox."""
-        if self.ttl_seconds is None or self._sandbox is None:
+        if self.config.ttl_seconds is None or self._sandbox is None:
             return
         try:
-            await self._sandbox.renew(timeout=timedelta_of(self.ttl_seconds))
+            await self._sandbox.renew(
+                timeout=timedelta(seconds=self.config.ttl_seconds)
+            )
         except Exception as exc:
             logger.debug(
                 "Could not renew the OpenSandbox lease for %s: %s",
@@ -336,11 +448,7 @@ class OpenSandboxSession:
             )
 
     async def _astart_repl(self) -> None:
-        sandbox = await self.astart()
-        source = Path(__file__).with_name("_opensandbox_repl.py").read_text(
-            encoding="utf-8"
-        )
-        await sandbox.files.write_file(REPL_PATH, source)
+        await self._awrite_file(REPL_PATH, _repl_source())
         start = (
             f"if [ -f {REPL_PID} ]; then kill -9 $(cat {REPL_PID}) 2>/dev/null; fi; "
             f"rm -f {REPL_SOCKET}; "
@@ -357,7 +465,9 @@ class OpenSandboxSession:
             )
         self._repl_started = True
 
-    async def arun_cell(self, code: str, *, timeout: float) -> OpenSandboxCellResult:
+    async def arun_cell(
+        self, code: str, *, timeout: float | None = None
+    ) -> OpenSandboxCellResult:
         """Run ``code`` in the persistent interpreter.
 
         Variables defined by earlier cells stay available. If the interpreter
@@ -366,6 +476,8 @@ class OpenSandboxSession:
         same happens in a new sandbox if this one was deleted since the last
         call. A cell is never sent twice.
         """
+        if timeout is None:
+            timeout = self.config.default_timeout
         _check_timeout(timeout)
         async with self._lock:
             try:
@@ -389,9 +501,19 @@ class OpenSandboxSession:
 
         prefix = [PYTHON_BIN, REPL_PATH, "call", REPL_SOCKET, str(timeout)]
         encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
-        result = await self.arun(
-            [*prefix, encoded], timeout=timeout + _EXEC_GRACE_SECONDS
-        )
+        command = [*prefix]
+        transfer_path: str | None = None
+        if len(encoded) > _MAX_INLINE_CELL_CHARS:
+            transfer_path = f"{SANDBOX_DIR}/cell-{uuid.uuid4().hex}.b64"
+            await self._awrite_file(transfer_path, encoded)
+            command.append(f"@{transfer_path}")
+        else:
+            command.append(encoded)
+        try:
+            result = await self.arun(command, timeout=timeout + _EXEC_GRACE_SECONDS)
+        finally:
+            if transfer_path is not None:
+                await self._aremove(transfer_path)
 
         if self._repl_started and result.exit_code == 0:
             try:
@@ -427,63 +549,20 @@ class OpenSandboxSession:
             await sandbox.destroy()
             logger.debug("Deleted OpenSandbox sandbox %s", self.sandbox_id)
         except self._sdk["SandboxException"] as exc:
-            logger.debug("OpenSandbox sandbox %s delete failed: %s", self.sandbox_id, exc)
+            logger.debug(
+                "OpenSandbox sandbox %s delete failed: %s", self.sandbox_id, exc
+            )
         finally:
-            self._sandbox = None
-            self.sandbox_id = None
+            self._forget()
 
 
 class _SandboxGoneError(RuntimeError):
     """The sandbox disappeared before or while a command ran."""
 
 
-def build_create_kwargs(
-    sdk: dict[str, Any],
-    *,
-    image: str | None,
-    snapshot_id: str | None,
-    cpu: str | None,
-    memory: str | None,
-    env_vars: Mapping[str, str],
-    metadata: Mapping[str, str],
-    network_block_all: bool,
-    ttl_seconds: int | None,
-    api_key: str | None,
-    domain: str | None,
-) -> dict[str, Any]:
-    """Shared create-call arguments for the async and sync SDK entry points."""
-    from datetime import timedelta
-
-    config_cls = sdk["ConnectionConfig"]
-    connection_kwargs: dict[str, Any] = {}
-    if api_key is not None:
-        connection_kwargs["api_key"] = api_key
-    if domain is not None:
-        connection_kwargs["domain"] = domain
-
-    kwargs: dict[str, Any] = {
-        "env": dict(env_vars) or None,
-        "metadata": dict(metadata) or None,
-        "connection_config": config_cls(**connection_kwargs),
-    }
-    if image is not None:
-        kwargs["image"] = image
-    else:
-        kwargs["snapshot_id"] = snapshot_id
-    resource: dict[str, str] = {}
-    if cpu is not None:
-        resource["cpu"] = cpu
-    if memory is not None:
-        resource["memory"] = memory
-    if resource:
-        kwargs["resource"] = resource
-    if ttl_seconds is not None:
-        kwargs["timeout"] = timedelta(seconds=ttl_seconds)
-    if network_block_all:
-        kwargs["network_policy"] = sdk["NetworkPolicy"](
-            default_action="deny", egress=[]
-        )
-    return kwargs
+@functools.lru_cache(maxsize=1)
+def _repl_source() -> str:
+    return Path(__file__).with_name("_opensandbox_repl.py").read_text(encoding="utf-8")
 
 
 def is_terminal_state(state: str | None) -> bool:
@@ -491,7 +570,11 @@ def is_terminal_state(state: str | None) -> bool:
     return (state or "") in ("Stopping", "Terminated", "Failed")
 
 
-def _to_exec_result(execution) -> OpenSandboxExecResult:
+def _script_command(script_path: str, timeout: float) -> list[str]:
+    return ["timeout", "-k", "2", str(timeout), PYTHON_BIN, script_path]
+
+
+def _to_exec_result(execution: Any) -> OpenSandboxExecResult:
     stdout = _format_messages(getattr(getattr(execution, "logs", None), "stdout", []))
     stderr = _format_messages(getattr(getattr(execution, "logs", None), "stderr", []))
     exit_code = getattr(execution, "exit_code", None)
@@ -511,7 +594,7 @@ def _to_exec_result(execution) -> OpenSandboxExecResult:
     )
 
 
-def _format_messages(messages) -> str:
+def _format_messages(messages: Any) -> str:
     parts = []
     for message in messages or []:
         text = getattr(message, "text", None)
@@ -520,21 +603,13 @@ def _format_messages(messages) -> str:
     return "".join(parts).replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
 
 
-def timedelta_of(seconds: float):
-    from datetime import timedelta
-
-    return timedelta(seconds=seconds)
-
-
 def _check_timeout(timeout: float) -> None:
     if timeout <= 0:
         raise ValueError(f"timeout must be positive, got {timeout}")
 
 
 def _restarted_result(name: str, value: str) -> OpenSandboxCellResult:
-    message = (
-        f"{value}. The interpreter was restarted; earlier variables are gone."
-    )
+    message = f"{value}. The interpreter was restarted; earlier variables are gone."
     return OpenSandboxCellResult(
         error=OpenSandboxCellError(
             name=name,

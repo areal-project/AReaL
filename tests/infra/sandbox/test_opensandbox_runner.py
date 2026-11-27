@@ -4,29 +4,34 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
+from datetime import timedelta
 
 import pytest
 
-import areal.infra.sandbox.opensandbox_runner as runner_module
-from areal.infra.sandbox import OpenSandboxRunner, OpenSandboxRunResult
-
 from tests.infra.sandbox._fake_opensandbox import (
+    FakeConnectionConfigSync,
     FakeExecution,
     FakeSandboxException,
     install,
 )
 
+import areal.infra.sandbox.opensandbox_runner as runner_module
+from areal.infra.sandbox import OpenSandboxRunner, OpenSandboxRunResult
+
+
+def _has_opensandbox_sdk() -> bool:
+    return importlib.util.find_spec("opensandbox") is not None
+
 
 def _has_opensandbox_endpoint() -> bool:
-    return bool(os.environ.get("OPEN_SANDBOX_DOMAIN"))
+    return _has_opensandbox_sdk() and bool(os.environ.get("OPEN_SANDBOX_DOMAIN"))
 
 
 @pytest.fixture
 def fake_sdk(monkeypatch):
-    fake = install(monkeypatch)
-    yield fake
-    fake.uninstall()
+    return install(monkeypatch)
 
 
 def test_run_result_fields_round_trip():
@@ -47,7 +52,7 @@ def test_runner_raises_clear_error_when_opensandbox_missing(monkeypatch):
     def raise_import_error():
         raise ImportError("opensandbox is not installed")
 
-    monkeypatch.setattr(runner_module, "_load_opensandbox_sdk", raise_import_error)
+    monkeypatch.setattr(runner_module, "load_opensandbox_sdk", raise_import_error)
 
     with pytest.raises(ImportError, match="opensandbox"):
         OpenSandboxRunner()
@@ -95,10 +100,65 @@ def test_runner_creates_sandbox_with_ttl(fake_sdk):
         runner.close()
 
     kwargs = fake_sdk.state.create_calls[0]
-    from datetime import timedelta
 
     assert kwargs["timeout"] == timedelta(seconds=600)
     assert kwargs["network_policy"].default_action == "deny"
+
+
+def test_runner_merges_default_metadata(fake_sdk):
+    fake_sdk.state.queue_execution(FakeExecution(stdout="", exit_code=0))
+
+    runner = OpenSandboxRunner(metadata={"team": "x"})
+    try:
+        runner.run("print('x')")
+    finally:
+        runner.close()
+
+    assert fake_sdk.state.create_calls[0]["metadata"] == {
+        "areal-sandbox": "true",
+        "team": "x",
+    }
+
+
+def test_runner_uses_sync_connection_config_and_ready_timeout(fake_sdk):
+    fake_sdk.state.queue_execution(FakeExecution(stdout="", exit_code=0))
+
+    runner = OpenSandboxRunner(api_key="k", create_timeout=77)
+    try:
+        runner.run("print('x')")
+    finally:
+        runner.close()
+
+    kwargs = fake_sdk.state.create_calls[0]
+    assert isinstance(kwargs["connection_config"], FakeConnectionConfigSync)
+    assert kwargs["ready_timeout"] == timedelta(seconds=77)
+
+
+def test_runner_run_after_close_raises_and_does_not_leak(fake_sdk):
+    fake_sdk.state.queue_execution(FakeExecution(stdout="", exit_code=0))
+    runner = OpenSandboxRunner()
+    runner.start()
+    sandbox_id = runner.sandbox_id
+    runner.close()
+
+    with pytest.raises(RuntimeError, match="OpenSandboxRunner is closed"):
+        runner.run("print('x')")
+
+    # No extra sandbox was created, the id is cleared, and the original
+    # sandbox was destroyed.
+    assert len(fake_sdk.state.create_calls) == 1
+    assert runner.sandbox_id is None
+    assert fake_sdk.state.destroyed_ids == [sandbox_id]
+
+
+def test_runner_close_clears_sandbox_id(fake_sdk):
+    runner = OpenSandboxRunner()
+    runner.start()
+    assert runner.sandbox_id is not None
+
+    runner.close()
+
+    assert runner.sandbox_id is None
 
 
 def test_runner_recreates_gone_sandbox(fake_sdk):
