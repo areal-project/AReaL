@@ -1,0 +1,24 @@
+areal/api/cli_args.py
+  h_0f206e897c097a 2837-2840
+areal/engine/awex/transport/nccl_group.py
+  h_0f206e897c097a 8,72-74
+areal/v2/inference_service/sglang/routed_experts_compat.py
+  h_0f206e897c097a 176-179,181-186
+tests/test_sglang_cuda_graph_config.py
+  h_0f206e897c097a 3-5,100-125,135-139,143-210
+tests/v2/inference_service/test_sglang_routed_experts_compat.py
+  h_0f206e897c097a 108-161
+tests/v2/weight_update/test_nccl_group.py
+  h_0f206e897c097a 3,13-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "224ecf4cec90c666d29afa2b87e6f7ebb45fcc3f",
+  "prompts": {},
+  "humans": {
+    "h_0f206e897c097a": {
+      "author": "sitabulaixizawaluduo <ljl2020110773@gmail.com>"
+    }
+  }
+}
