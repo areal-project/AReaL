@@ -8,9 +8,15 @@ logger = logging.getLogger("CLEVR70KReward")
 
 
 def extract_answer(pred_str, data_name, use_last_number=True):
-    match = re.findall(r"\[([0-9\.]+)\]", pred_str)
-    if match:
-        return match[-1]
+    _, opening, tail = pred_str.rpartition("[")
+    answer, closing, _ = tail.partition("]")
+    answer = answer.strip()
+    if (
+        opening
+        and closing
+        and re.fullmatch(r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)", answer)
+    ):
+        return answer
 
     return ""
 
@@ -25,7 +31,7 @@ def clevr_count_70k_reward_fn(
         if not sol or not ans:
             return 0.0
 
-        is_correct = sol.strip() == ans.strip()
+        is_correct = sol == ans.strip()
         if is_correct:
             logger.info(f"completions: {completions}, answer: {answer}")
         return float(is_correct)
