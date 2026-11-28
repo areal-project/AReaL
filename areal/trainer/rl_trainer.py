@@ -1062,6 +1062,10 @@ class PPOTrainer:
                         traj["distill_loss_weight"] = (
                             self.config.teacher.distill_loss_weight
                         )
+                        traj["log_distill_diagnostics"] = (
+                            self.config.teacher.log_distill_diagnostics
+                        )
+                        traj["kl_estimator"] = self.config.teacher.kl_estimator
                 if self._should_offload_teacher:
                     self._offload_model(self.teacher, role="teacher")
 

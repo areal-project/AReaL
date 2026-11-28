@@ -4311,7 +4311,46 @@ class TeacherConfig:
         metadata={"help": "Distillation loss weight"},
     )
 
+    log_distill_diagnostics: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Log detached, unweighted same-token values of all three "
+                "sampled reverse-KL estimators (distill_kl_k1/k2/k3) for "
+                "validation runs. These describe the behavior-distribution "
+                "draws rather than an importance-weighted current-student KL, "
+                "and do not affect the loss, its gradient, or rkl_loss."
+            )
+        },
+    )
+    kl_estimator: str = field(
+        default="k1",
+        metadata={
+            "help": (
+                "Sampled reverse-KL estimator reported as the pure-KD forward "
+                "value. With x = log pi_T - log pi_theta: 'k1' (default) keeps "
+                "the legacy signed log-ratio; 'k2' reports 0.5*x^2; 'k3' "
+                "reports expm1(x) - x. The selected value is detached and "
+                "transplanted onto the policy loss, so clipping, rejection and "
+                "the gradient are unchanged: all three forms are "
+                "gradient-equivalent on matched finite inputs. Only used when "
+                "rl_loss_weight == 0; other paths raise."
+            ),
+            "choices": ["k1", "k2", "k3"],
+        },
+    )
+
     def __post_init__(self):
+        if self.kl_estimator not in ("k1", "k2", "k3"):
+            raise ValueError(
+                f"teacher.kl_estimator must be 'k1', 'k2', or 'k3', "
+                f"got {self.kl_estimator!r}."
+            )
+        if self.kl_estimator != "k1" and self.rl_loss_weight != 0:
+            raise ValueError(
+                f"teacher.kl_estimator={self.kl_estimator!r} is only supported "
+                "for sampled pure-KD distillation (rl_loss_weight=0)."
+            )
         if self.rollout is not None and self.train is not None:
             warnings.warn(
                 "Both teacher.rollout and teacher.train are configured; "
