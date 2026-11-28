@@ -300,16 +300,14 @@ def test_non_arithmetic_syntax_is_rejected(expression, quiet_scores):
     """Reject Python syntax and alternate numeric spellings before evaluation."""
     assert not validate_equation(expression, [1, 2])
     assert evaluate_equation(expression) is None
-    # Use a single-line answer wrapper: extraction is intentionally unchanged.
-    if "\n" not in expression:
-        assert (
-            compute_score(
-                f"<answer>{expression}</answer>",
-                {"numbers": [1, 2], "target": 3},
-                format_score=0.25,
-            )
-            == 0.25
+    assert (
+        compute_score(
+            f"<answer>{expression}</answer>",
+            {"numbers": [1, 2], "target": 3},
+            format_score=0.25,
         )
+        == 0.25
+    )
 
 
 @pytest.mark.parametrize("value", [None, 1, 1.5, True, b"1+2", [], {}])
@@ -370,3 +368,39 @@ def test_invalid_last_answer_cannot_reuse_earlier_valid_answer(quiet_scores):
     """Never fall back to an earlier answer when the final answer is invalid."""
     truth = {"numbers": [1, 5, 2], "target": 3}
     assert compute_score("<answer>5-2*1</answer> <answer>1.5*2</answer>", truth) == 0.1
+    assert compute_score("<answer>5-2*1</answer>\n<answer>1.5*2</answer>", truth) == 0.1
+
+
+@pytest.mark.parametrize(
+    "suffix", ["\n", "\n\n", "\n<|im_end|>", "\n<|endoftext|>", "\nDone."]
+)
+def test_lines_after_final_answer_keep_reward_levels(suffix, quiet_scores):
+    """train.py decodes with special tokens, so EOS can follow on its own line."""
+    truth = {"numbers": [1, 2], "target": 3}
+    reasoning = "<think>1 + 2 = 3</think>\n"
+    assert compute_score(f"{reasoning}<answer>1+2</answer>{suffix}", truth) == 1.0
+    assert compute_score(f"{reasoning}<answer>1*2</answer>{suffix}", truth) == 0.1
+
+
+def test_answer_tags_may_wrap_the_equation_on_separate_lines(quiet_scores):
+    """The answer pattern is DOTALL; an equation on its own line must be scored."""
+    truth = {"numbers": [1, 2], "target": 3}
+    assert compute_score("<answer>\n1 + 2\n</answer>", truth) == 1.0
+    assert compute_score("<answer>\n1 * 2\n</answer>", truth) == 0.1
+
+
+def test_unclosed_answer_tags_after_final_answer_are_cheap():
+    """Searching the whole completion must not rescan unclosed tags to the end."""
+    code = """
+from examples.countdown.reward_score import compute_score
+text = '<answer>1+2</answer>\\n' + '<answer>\\n' * 50_000
+assert compute_score(text, {'numbers': [1, 2], 'target': 3}) == 1.0
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        timeout=5,
+        capture_output=True,
+        text=True,
+    )
