@@ -246,9 +246,35 @@ jobs:
           fi
           uv run python scripts/ci_test_report.py summarize "${report_args[@]}"
 
+  nightly-grpo-debug:
+    name: Geometry3K nightly GRPO debug
+    if: github.repository == 'areal-project/AReaL' && github.head_ref == 'debug/ascend-nightly-grpo-pr' && github.event.pull_request.head.repo.full_name == 'Adiactive/AReaL'
+    runs-on: linux-aarch64-a3-800i-16
+    timeout-minutes: 720
+    container:
+      image: swr.cn-north-12.myhuaweicloud.com/ascend/areal_npu:a3-nightly
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install the tested revision
+        run: |
+          cp pyproject.npu.toml pyproject.toml
+          python -m pip install -e . --no-deps
+      - name: Train and verify final checkpoint
+        env:
+          GRPO_MODEL_PATH: ${{ vars.ASCEND_NIGHTLY_GRPO_MODEL }}
+          DATASET_PATH: ${{ vars.ASCEND_NIGHTLY_GEOMETRY3K }}
+        run: bash scripts/ascend_nightly_train.sh grpo
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ascend-nightly-grpo-debug
+          path: nightly-output/metrics.json
+          if-no-files-found: error
+
   npu-pr-tests:
     name: npu-pr-tests
-    if: github.repository == 'areal-project/AReaL'
+    if: github.repository == 'areal-project/AReaL' && (github.head_ref != 'debug/ascend-nightly-grpo-pr' || github.event.pull_request.head.repo.full_name != 'Adiactive/AReaL')
     runs-on: linux-aarch64-a3-800i-8
     timeout-minutes: 135
     container:
