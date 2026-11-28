@@ -391,7 +391,8 @@ class RTensor:
         For dict objects that look like trajectory dicts (contain attention_mask),
         trailing padding is trimmed before storage to keep each RTensor compact.
         When ``preserve_tensor_aliases`` is enabled, repeated references to the
-        same tensor object share one stored shard for this root call.
+        same tensor object share one stored shard for this root call. CPU image
+        tensors may back their shards directly and must remain immutable.
 
         Parameters
         ----------
@@ -443,15 +444,30 @@ class RTensor:
             # split_and_unpad_tensor auto-derives trim lengths from attention_mask.
             attn_mask = obj.get("attention_mask")
             if isinstance(attn_mask, torch.Tensor) and attn_mask.ndim >= 2:
-                from areal.utils.data import split_and_unpad_tensor
+                from areal.utils.data import is_multi_modal_key, split_and_unpad_tensor
 
+                # Token compaction deep-copies nested fields. Keep immutable
+                # vision inputs available to the alias memo in their original form.
+                shared_vision = (
+                    {
+                        k: v
+                        for k, v in obj.items()
+                        if isinstance(k, str) and is_multi_modal_key(k)
+                    }
+                    if tensor_memo is not None
+                    else None
+                )
                 compacted = split_and_unpad_tensor(
-                    obj,
+                    {k: v for k, v in obj.items() if k not in shared_vision}
+                    if shared_vision
+                    else obj,
                     n_trajs=1,
                     traj_group_sizes=[attn_mask.shape[0]],
                 )
                 if compacted is not None:
                     obj = compacted[0]
+                    if shared_vision:
+                        obj.update(shared_vision)
             return {
                 k: RTensor._remotize_recursive(v, node_addr, tensor_memo)
                 for k, v in obj.items()
