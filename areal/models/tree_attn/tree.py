@@ -13,6 +13,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask
@@ -137,106 +138,163 @@ class TrieNode:
 # =============================================================================
 
 
-class _BuildNode:
-    """Temporary node structure used during trie construction."""
+class _RunNode:
+    """Temporary compressed-run node used during trie construction."""
 
-    __slots__ = ("tree_id", "token_id", "node_id", "children", "is_end", "sequence_ids")
+    __slots__ = ("start_id", "tokens", "children", "is_end", "sequence_ids")
 
-    def __init__(self, tree_id: int, token_id: int, node_id: int):
+    def __init__(
+        self,
+        start_id: int,
+        tokens: np.ndarray,
+        is_end: bool = False,
+        sequence_ids: list[int] | None = None,
+        children: dict[int, _RunNode] | None = None,
+    ):
+        self.start_id = start_id
+        self.tokens = tokens
+        self.children: dict[int, _RunNode] = {} if children is None else children
+        self.is_end = is_end
+        self.sequence_ids: list[int] = [] if sequence_ids is None else sequence_ids
+
+
+class _TrieBuilder:
+    """Run-based trie builder that avoids per-token Python nodes and double walks."""
+
+    __slots__ = ("tree_id", "root", "num_tokens")
+
+    def __init__(self, tree_id: int):
         self.tree_id = tree_id
-        self.token_id = token_id
-        self.node_id = node_id
-        self.children: dict[int, _BuildNode] = {}
-        self.is_end = False
-        self.sequence_ids: list[int] = []
+        self.root = _RunNode(start_id=-1, tokens=np.empty(0, dtype=np.int64))
+        self.num_tokens = 0
 
+    def match(self, seq: np.ndarray) -> tuple[list[_RunNode], _RunNode, int, int]:
+        """Walk ``seq`` through existing runs and return split/insertion context."""
+        matched_nodes: list[_RunNode] = []
+        current = self.root
+        pos = 0
+        seq_len = len(seq)
 
-def _count_additional_nodes(root: _BuildNode, sequence: list[int]) -> int:
-    """Count how many new nodes are needed to insert sequence into root."""
-    current = root
-    for idx, token in enumerate(sequence):
-        child = current.children.get(token)
-        if child is None:
-            return len(sequence) - idx
-        current = child
-    return 0
+        while pos < seq_len:
+            child = current.children.get(int(seq[pos]))
+            if child is None:
+                return matched_nodes, current, len(current.tokens), pos
 
+            child_tokens = child.tokens
+            child_len = len(child_tokens)
+            rem = seq_len - pos
+            m = child_len if child_len <= rem else rem
 
-def _insert_sequence(
-    root: _BuildNode,
-    all_nodes: list[_BuildNode],
-    sequence: list[int],
-    tree_id: int,
-    sequence_id: int,
-) -> None:
-    """Insert a sequence into the trie, mutating it in-place."""
-    current = root
-    for token in sequence:
-        if token not in current.children:
-            node_id = len(all_nodes)
-            current.children[token] = _BuildNode(tree_id, token, node_id)
-            all_nodes.append(current.children[token])
-        current.children[token].sequence_ids.append(sequence_id)
-        current = current.children[token]
-    current.is_end = True
+            if np.array_equal(child_tokens[:m], seq[pos : pos + m]):
+                k = m
+            else:
+                k = int(np.argmax(child_tokens[:m] != seq[pos : pos + m]))
+
+            if k < child_len:
+                return matched_nodes, child, k, pos + k
+
+            matched_nodes.append(child)
+            pos += child_len
+            current = child
+
+        return matched_nodes, current, len(current.tokens), pos
+
+    def insert_at(
+        self,
+        seq: np.ndarray,
+        sequence_id: int,
+        matched_nodes: list[_RunNode],
+        stop_node: _RunNode,
+        split_offset: int,
+        matched_len: int,
+    ) -> None:
+        """Insert ``seq`` reusing the walk state returned by :meth:`match`."""
+        for node in matched_nodes:
+            node.sequence_ids.append(sequence_id)
+
+        seq_len = len(seq)
+        if stop_node is self.root:
+            if seq_len == 0:
+                self.root.is_end = True
+                return
+            self.root.children[int(seq[0])] = _RunNode(
+                start_id=self.num_tokens,
+                tokens=seq,
+                is_end=True,
+                sequence_ids=[sequence_id],
+            )
+            self.num_tokens += seq_len
+            return
+
+        if split_offset == len(stop_node.tokens):
+            if matched_len == seq_len:
+                stop_node.is_end = True
+                return
+            stop_node.children[int(seq[matched_len])] = _RunNode(
+                start_id=self.num_tokens,
+                tokens=seq[matched_len:],
+                is_end=True,
+                sequence_ids=[sequence_id],
+            )
+            self.num_tokens += seq_len - matched_len
+            return
+
+        # Mid-run divergence or sequence ending mid-run: split stop_node at split_offset
+        suffix = _RunNode(
+            start_id=stop_node.start_id + split_offset,
+            tokens=stop_node.tokens[split_offset:],
+            is_end=stop_node.is_end,
+            sequence_ids=stop_node.sequence_ids.copy(),
+            children=stop_node.children,
+        )
+        stop_node.tokens = stop_node.tokens[:split_offset]
+        stop_node.children = {int(suffix.tokens[0]): suffix}
+        stop_node.sequence_ids.append(sequence_id)
+
+        if matched_len == seq_len:
+            stop_node.is_end = True
+            return
+
+        stop_node.is_end = False
+        stop_node.children[int(seq[matched_len])] = _RunNode(
+            start_id=self.num_tokens,
+            tokens=seq[matched_len:],
+            is_end=True,
+            sequence_ids=[sequence_id],
+        )
+        self.num_tokens += seq_len - matched_len
 
 
 @trace_perf("tree_attn._compress_trie")
-def _compress_trie(root: _BuildNode) -> TrieNode:
-    """Compress a trie by merging linear chains into single TrieNodes."""
-    trie_root = TrieNode(tree_id=root.tree_id)
+def _compress_trie(builder: _TrieBuilder) -> TrieNode:
+    """Convert run-based build trie into a compressed TrieNode structure."""
+    trie_root = TrieNode(tree_id=builder.tree_id)
 
-    def _compress_chain(
-        node: _BuildNode,
+    def _to_trie_node(
+        node: _RunNode,
         ancestors: list[TrieNode],
     ) -> TrieNode:
-        """Compress a chain of nodes with single children into one TrieNode."""
-        tokens: list[int] = []
-        current = node
-        start_id = node.node_id
-
-        # Follow single-child chains
-        while True:
-            tokens.append(current.token_id)
-            if len(current.children) != 1 or current.is_end:
-                break
-            # Get the single child
-            next_child = next(iter(current.children.values()))
-            # Verify consistency
-            if current.sequence_ids != next_child.sequence_ids:
-                raise ValueError(
-                    f"Sequence IDs mismatch along chain: "
-                    f"{current.sequence_ids} vs {next_child.sequence_ids}"
-                )
-            if next_child.node_id != current.node_id + 1:
-                raise ValueError("Node IDs not consecutive along chain.")
-            current = next_child
-
-        # Create compressed node
+        tokens = node.tokens.tolist()
         trie_node = TrieNode(
-            tree_id=root.tree_id,
-            start_idx=start_id,
-            end_idx=current.node_id,
+            tree_id=builder.tree_id,
+            start_idx=node.start_id,
+            end_idx=node.start_id + len(tokens) - 1,
             tokens=tokens,
-            sequence_ids=current.sequence_ids.copy(),
+            sequence_ids=node.sequence_ids.copy(),
             ancestors=ancestors.copy(),
         )
         trie_root.nodes.append(trie_node)
 
-        # Recursively compress children
-        if current.children:
-            for token, child in sorted(current.children.items()):
-                trie_node.children[token] = _compress_chain(
-                    child,
-                    ancestors + [trie_node],
-                )
+        if node.children:
+            child_ancestors = ancestors + [trie_node]
+            for token, child in sorted(node.children.items()):
+                trie_node.children[token] = _to_trie_node(child, child_ancestors)
 
         return trie_node
 
-    # Compress all children of root
-    if root.children:
-        for token, child in sorted(root.children.items()):
-            trie_root.children[token] = _compress_chain(child, [])
+    if builder.root.children:
+        for token, child in sorted(builder.root.children.items()):
+            trie_root.children[token] = _to_trie_node(child, [])
 
     return trie_root
 
@@ -492,23 +550,18 @@ def _greedy_build_tries(
 ) -> tuple[list[TrieNode], list[int]]:
     """Build tries using greedy packing strategy."""
     sequences = _extract_sequences(data)
-    forests: list[dict[str, Any]] = []
+    builders: list[_TrieBuilder] = []
 
     for seq_id, seq in enumerate(sequences):
+        seq_len = len(seq)
         inserted = False
 
-        # Try to insert into existing trees
-        for tree_id, tree in enumerate(forests):
-            additional = _count_additional_nodes(tree["root"], seq)
-            if tree["nodes"] + additional <= max_tokens_per_tree:
-                _insert_sequence(
-                    tree["root"],
-                    tree["all_nodes"],
-                    seq,
-                    tree_id,
-                    seq_id,
-                )
-                tree["nodes"] += additional
+        # Try to insert into existing trees (reuse match walk on hit)
+        for builder in builders:
+            match_state = builder.match(seq)
+            additional = seq_len - match_state[3]
+            if builder.num_tokens + additional <= max_tokens_per_tree:
+                builder.insert_at(seq, seq_id, *match_state)
                 inserted = True
                 break
 
@@ -516,26 +569,24 @@ def _greedy_build_tries(
             continue
 
         # Create new tree
-        if len(seq) > max_tokens_per_tree:
+        if seq_len > max_tokens_per_tree:
             raise ValueError(
-                f"Sequence length {len(seq)} exceeds max_tokens_per_tree "
+                f"Sequence length {seq_len} exceeds max_tokens_per_tree "
                 f"{max_tokens_per_tree}; adjust limit or split sequences."
             )
 
-        new_tree_id = len(forests)
-        new_root = _BuildNode(new_tree_id, -1, -1)
-        all_nodes: list[_BuildNode] = []
-        _insert_sequence(new_root, all_nodes, seq, new_tree_id, seq_id)
-        forests.append({"root": new_root, "all_nodes": all_nodes, "nodes": len(seq)})
+        new_builder = _TrieBuilder(len(builders))
+        new_builder.insert_at(seq, seq_id, [], new_builder.root, 0, 0)
+        builders.append(new_builder)
 
     # Compress all trees
-    tries = [_compress_trie(f["root"]) for f in forests]
-    num_tokens_list = [f["nodes"] for f in forests]
+    tries = [_compress_trie(b) for b in builders]
+    num_tokens_list = [b.num_tokens for b in builders]
 
     return tries, num_tokens_list
 
 
-def _extract_sequences(data: dict[str, Any]) -> list[list[int]]:
+def _extract_sequences(data: dict[str, Any]) -> list[np.ndarray]:
     """Extract token sequences from padded input data."""
     assert "input_ids" in data, "Input data must contain 'input_ids'"
     assert "attention_mask" in data, "Input data must contain 'attention_mask'"
@@ -543,11 +594,14 @@ def _extract_sequences(data: dict[str, Any]) -> list[list[int]]:
     input_ids = data["input_ids"]
     attention_mask = data["attention_mask"]
 
-    sequences = []
-    for ids, mask in zip(input_ids, attention_mask):
-        seq = ids[mask.bool()].tolist()
-        sequences.append(seq)
-    return sequences
+    if input_ids.shape[0] == 0:
+        return []
+
+    mask_bool = attention_mask.bool()
+    lengths = mask_bool.sum(dim=1).cpu().numpy()
+    flat_tokens = input_ids[mask_bool].cpu().numpy()
+    split_points = np.cumsum(lengths[:-1])
+    return np.split(flat_tokens, split_points)
 
 
 def _pack_input_ids(
