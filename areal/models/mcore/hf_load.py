@@ -792,5 +792,5 @@ def load_weights_from_hf_with_mbridge_fast(
         else:
             logger.info(
                 f"ValueHead checkpoint not found at {value_head_path}, "
-                "using random initialization (normal for first training)."
+                "keeping zero-initialized ValueHead (normal for first training)."
             )

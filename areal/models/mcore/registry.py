@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import dataclasses
 import inspect
 import types
+from collections.abc import Callable
 from functools import partial
 from typing import Any
 
@@ -55,9 +57,12 @@ class ValueHead(torch.nn.Linear):
         if self.sequence_parallel:
             self.weight.sequence_parallel = True
 
-        self.weight.data.normal_(mean=0.0, std=0.02)
+        # Zero init (as in OpenAI's lm-human-preferences): V starts at 0 so early
+        # advantages are not dominated by noise from an untrained head, and the
+        # replicated head starts identical across tensor-parallel ranks.
+        torch.nn.init.zeros_(self.weight)
         if bias:
-            self.bias.data.zero_()
+            torch.nn.init.zeros_(self.bias)
 
     def forward(
         self,
@@ -308,6 +313,107 @@ def unwrap_to_gpt_model(model: torch.nn.Module) -> GPTModel:
     raise TypeError(f"Model could not be unwrapped to GPTModel. Got {type(_model)}")
 
 
+def _unwrap_wrapper_modules(model: torch.nn.Module) -> torch.nn.Module:
+    raw_model = model
+    while not isinstance(raw_model, GPTModel) and hasattr(raw_model, "module"):
+        raw_model = raw_model.module
+    return raw_model
+
+
+def _untie_critic_embeddings(model: torch.nn.Module, gpt_model: GPTModel) -> None:
+    gpt_model.share_embeddings_and_output_weights = False
+    raw_model = _unwrap_wrapper_modules(model)
+    if raw_model is not gpt_model and hasattr(
+        raw_model, "share_embeddings_and_output_weights"
+    ):
+        if not isinstance(
+            getattr(type(raw_model), "share_embeddings_and_output_weights", None),
+            property,
+        ):
+            raw_model.share_embeddings_and_output_weights = False
+    embedding = getattr(gpt_model, "embedding", None)
+    word_embeddings = getattr(embedding, "word_embeddings", None)
+    emb_weight = getattr(word_embeddings, "weight", None)
+    if emb_weight is not None:
+        for attr in ("shared_embedding", "shared", "zero_out_wgrad"):
+            if getattr(emb_weight, attr, False):
+                setattr(emb_weight, attr, False)
+
+
+@contextlib.contextmanager
+def _untie_hf_config_for_critic(hf_config: Any):
+    targets = []
+    for cfg in (hf_config, getattr(hf_config, "text_config", None)):
+        if cfg is not None and hasattr(cfg, "tie_word_embeddings"):
+            targets.append((cfg, cfg.tie_word_embeddings))
+            cfg.tie_word_embeddings = False
+    try:
+        yield
+    finally:
+        for cfg, prev in targets:
+            cfg.tie_word_embeddings = prev
+
+
+def _install_value_head_on_model(
+    model: torch.nn.Module,
+    tf_config: TransformerConfig,
+) -> None:
+    gpt_model = unwrap_to_gpt_model(model)
+    _untie_critic_embeddings(model, gpt_model)
+    if getattr(gpt_model, "post_process", True):
+        _replace_output_layer_with_value_head(gpt_model, tf_config)
+
+
+def _value_head_creation_callback(
+    tf_config: TransformerConfig,
+) -> Callable[..., None]:
+    """mbridge post_model_creation_callbacks entry that installs ValueHead pre-DDP."""
+
+    def install_value_head(model: torch.nn.Module, *args: Any, **kwargs: Any) -> None:
+        _install_value_head_on_model(model, tf_config)
+
+    return install_value_head
+
+
+def _value_head_pre_wrap_hook(
+    tf_config: TransformerConfig,
+) -> Callable[[list[torch.nn.Module]], list[torch.nn.Module]]:
+    """megatron-bridge pre-wrap hook that installs ValueHead pre-DDP."""
+
+    def install_value_heads(
+        models: list[torch.nn.Module],
+    ) -> list[torch.nn.Module]:
+        for model in models:
+            _install_value_head_on_model(model, tf_config)
+        return models
+
+    return install_value_heads
+
+
+def _verify_critic_value_heads(models: list[GPTModel | DDP]) -> None:
+    for model in models:
+        raw_model = _unwrap_wrapper_modules(model)
+        gpt_model = unwrap_to_gpt_model(model)
+        if getattr(gpt_model, "share_embeddings_and_output_weights", False) or getattr(
+            raw_model, "share_embeddings_and_output_weights", False
+        ):
+            raise RuntimeError(
+                "Critic model still ties its output layer to the word embeddings."
+            )
+        if not getattr(gpt_model, "post_process", True):
+            continue
+        output_layer = getattr(gpt_model, "output_layer", None)
+        if not isinstance(output_layer, ValueHead):
+            raise RuntimeError(
+                "Critic post-process stage was built without a ValueHead."
+            )
+        if isinstance(model, DDP) and not hasattr(output_layer.weight, "main_grad"):
+            raise RuntimeError(
+                "Critic ValueHead is not registered in Megatron DDP gradient buffers; "
+                "it must be installed before DDP wrapping."
+            )
+
+
 def _replace_actor_output_layers(
     models: list[GPTModel | DDP],
     *,
@@ -419,25 +525,55 @@ def make_mcore_model(
         if use_lora or is_critic:
             raise ValueError("mtp_only does not support LoRA or critic models")
 
-    if bridge is not None and bridge_type == "mbridge":
-        models = bridge.get_model(
-            # TODO: Add DDP options when supporting training
-            wrap_with_ddp=mcore_config.wrap_with_ddp,
-            ddp_config=dataclasses.asdict(mcore_config.ddp),
-            use_torch_fsdp2=mcore_config.use_torch_fsdp2,
-            use_custom_fsdp=mcore_config.use_custom_fsdp,
-            fp16=tf_config.fp16,
-            bf16=tf_config.bf16,
-            use_precision_aware_optimizer=mcore_config.use_precision_aware_optimizer,
-            overlap_param_gather_with_optimizer_step=mcore_config.overlap_param_gather_with_optimizer_step,
+    if is_critic and mcore_config is not None and mcore_config.enable_mtp:
+        raise ValueError(
+            "Megatron critic models do not support MTP; set megatron.enable_mtp=False."
         )
+
+    if bridge is not None and bridge_type == "mbridge":
+        extra_kwargs: dict[str, Any] = {}
+        if is_critic:
+            if (
+                "post_model_creation_callbacks"
+                not in inspect.signature(bridge.get_model).parameters
+            ):
+                raise NotImplementedError(
+                    "Megatron critic requires an mbridge version whose get_model() "
+                    "accepts post_model_creation_callbacks."
+                )
+            for cfg in (tf_config, getattr(bridge, "config", None)):
+                if cfg is not None and getattr(cfg, "mtp_num_layers", None):
+                    logger.warning(
+                        "Dropping MTP head (mtp_num_layers=%s -> None) for critic model.",
+                        cfg.mtp_num_layers,
+                    )
+                    cfg.mtp_num_layers = None
+            extra_kwargs["post_model_creation_callbacks"] = [
+                _value_head_creation_callback(tf_config)
+            ]
+
+        untie_ctx = (
+            _untie_hf_config_for_critic(getattr(bridge, "hf_config", hf_config))
+            if is_critic
+            else contextlib.nullcontext()
+        )
+        with untie_ctx:
+            models = bridge.get_model(
+                # TODO: Add DDP options when supporting training
+                wrap_with_ddp=mcore_config.wrap_with_ddp,
+                ddp_config=dataclasses.asdict(mcore_config.ddp),
+                use_torch_fsdp2=mcore_config.use_torch_fsdp2,
+                use_custom_fsdp=mcore_config.use_custom_fsdp,
+                fp16=tf_config.fp16,
+                bf16=tf_config.bf16,
+                use_precision_aware_optimizer=mcore_config.use_precision_aware_optimizer,
+                overlap_param_gather_with_optimizer_step=mcore_config.overlap_param_gather_with_optimizer_step,
+                **extra_kwargs,
+            )
         models = list(models)
 
-        # Replace output_layer with ValueHead for critic models
         if is_critic:
-            for model in models:
-                _model = unwrap_to_gpt_model(model)
-                _replace_output_layer_with_value_head(_model, tf_config)
+            _verify_critic_value_heads(models)
         else:
             _configure_actor_output_layers(models, mcore_config)
 
@@ -585,6 +721,9 @@ def make_mcore_model(
         if mcore_config.use_deterministic_algorithms:
             set_deterministic_algorithms(provider, prebuild=True)
 
+        if is_critic and hasattr(provider, "share_embeddings_and_output_weights"):
+            provider.share_embeddings_and_output_weights = False
+
         provider.finalize()
 
         if getattr(hf_config, "model_type", None) in (
@@ -620,6 +759,9 @@ def make_mcore_model(
                 )
             )
 
+        if is_critic:
+            provider.register_pre_wrap_hook(_value_head_pre_wrap_hook(tf_config))
+
         ddp_config = MCoreDDPConfig(**dataclasses.asdict(mcore_config.ddp))
         if use_lora:
             ddp_config.use_distributed_optimizer = False
@@ -638,9 +780,7 @@ def make_mcore_model(
         models = list(models)
 
         if is_critic:
-            for model in models:
-                _model = unwrap_to_gpt_model(model)
-                _replace_output_layer_with_value_head(_model, tf_config)
+            _verify_critic_value_heads(models)
         else:
             _configure_actor_output_layers(models, mcore_config)
 
@@ -664,6 +804,12 @@ def make_mcore_model(
         return models
 
     else:
+        if is_critic and getattr(tf_config, "mtp_num_layers", None):
+            logger.warning(
+                "Dropping MTP head (mtp_num_layers=%s -> None) for critic model.",
+                tf_config.mtp_num_layers,
+            )
+            tf_config.mtp_num_layers = None
         if mcore_config is not None and mcore_config.enable_router_replay:
             tf_config.moe_enable_routing_replay = True
         if (
@@ -699,9 +845,9 @@ def make_mcore_model(
             # vp_stage=None TODO: virtual pipeline parallel
         )
 
-        # Replace output_layer with ValueHead for critic models
+        # Install ValueHead before DDP wrapping for critic models
         if is_critic:
-            _replace_output_layer_with_value_head(model, tf_config)
+            _install_value_head_on_model(model, tf_config)
         else:
             _configure_actor_output_layers([model], mcore_config)
 
@@ -713,5 +859,10 @@ def make_mcore_model(
                 module=model,
                 disable_bucketing=False,
             )
-            return [wrapped]
-        return [model]
+            result = [wrapped]
+        else:
+            result = [model]
+
+        if is_critic:
+            _verify_critic_value_heads(result)
+        return result
