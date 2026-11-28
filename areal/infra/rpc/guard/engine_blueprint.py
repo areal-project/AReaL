@@ -459,9 +459,11 @@ def call_engine_method():
         # Deserialize data
         raw_args = deserialize_value(raw_args)
         raw_kwargs = deserialize_value(raw_kwargs)
-        # Fetch remote tensors
-        args = RTensor.localize(raw_args)
-        kwargs = RTensor.localize(raw_kwargs)
+        share_vision = method_name in getattr(
+            engine, "shared_vision_rpc_methods", ()
+        ) and getattr(engine, "is_vision_model", False)
+        args = RTensor.localize(raw_args, preserve_vision_aliases=share_vision)
+        kwargs = RTensor.localize(raw_kwargs, preserve_vision_aliases=share_vision)
 
         def execute_in_engine_thread():
             try:

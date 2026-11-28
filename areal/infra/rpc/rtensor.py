@@ -7,6 +7,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import chain
 from threading import Lock
 from typing import Any, Protocol, cast
 
@@ -488,7 +489,12 @@ class RTensor:
         return obj
 
     @staticmethod
-    def localize(obj: Any, *, preserve_tensor_aliases: bool = False) -> Any:
+    def localize(
+        obj: Any,
+        *,
+        preserve_tensor_aliases: bool = False,
+        preserve_vision_aliases: bool = False,
+    ) -> Any:
         """Convert RTensors to local tensors in nested structures.
 
         Inverse of remotize() - fetches remote data and converts to local tensors.
@@ -503,6 +509,9 @@ class RTensor:
         preserve_tensor_aliases : bool, default=False
             Preserve aliases represented by repeated shard IDs within this root
             call. The default retains the existing localization behavior.
+        preserve_vision_aliases : bool, default=False
+            Preserve aliases only within immutable multimodal fields. Other
+            tensors retain per-reference localization in the same fetch batch.
 
         Returns
         -------
@@ -511,9 +520,15 @@ class RTensor:
         """
         # Pre-fetch all remote tensors concurrently
         rtensors: list[RTensor] = []
-        RTensor._collect_all(obj, rtensors)
+        vision_refs = (
+            [] if preserve_vision_aliases and not preserve_tensor_aliases else None
+        )
+        RTensor._collect_all(obj, rtensors, vision_refs)
         if preserve_tensor_aliases:
             RTensor._localize_preserving_aliases(rtensors)
+            return RTensor._localize_recursive(obj)
+        if vision_refs:
+            RTensor._localize_preserving_aliases(vision_refs, independent=rtensors)
             return RTensor._localize_recursive(obj)
 
         meta_rtensors = [rt for rt in rtensors if rt.data.is_meta]
@@ -541,16 +556,21 @@ class RTensor:
         return RTensor._localize_recursive(obj)
 
     @staticmethod
-    def _localize_preserving_aliases(rtensors: list[RTensor]) -> None:
-        """Resolve each shard once and assign its tensor to every reference."""
+    def _localize_preserving_aliases(
+        rtensors: list[RTensor], *, independent: Iterable[RTensor] = ()
+    ) -> None:
+        """Fetch shared groups and independent references in a single batch."""
         references_by_shard: dict[Any, list[RTensor]] = {}
         for rtensor in rtensors:
             references_by_shard.setdefault(rtensor.shard.shard_id, []).append(rtensor)
 
-        misses: dict[Any, list[RTensor]] = {}
+        misses: list[list[RTensor]] = []
 
         with _fetch_buffer_lock:
-            for shard_id, references in references_by_shard.items():
+            for references in chain(
+                references_by_shard.values(), ([rt] for rt in independent)
+            ):
+                shard_id = references[0].shard.shard_id
                 tensor = next(
                     (
                         rtensor.data
@@ -566,31 +586,41 @@ class RTensor:
                     for rtensor in references:
                         rtensor.data = tensor
                 else:
-                    misses[shard_id] = references
+                    misses.append(references)
 
         if not misses:
             return
 
-        representatives = [references[0] for references in misses.values()]
+        representatives = [references[0] for references in misses]
         results = get_backend().fetch([rtensor.shard for rtensor in representatives])
         with _fetch_buffer_lock:
-            for references, tensor in zip(misses.values(), results, strict=True):
+            for references, tensor in zip(misses, results, strict=True):
                 shard_id = references[0].shard.shard_id
                 _fetch_buffer[shard_id] = tensor
                 for rtensor in references:
                     rtensor.data = tensor
 
     @staticmethod
-    def _collect_all(obj: Any, result: list[RTensor]) -> None:
-        """Collect all RTensor instances from a nested structure."""
+    def _collect_all(
+        obj: Any, result: list[RTensor], vision_refs: list[RTensor] | None = None
+    ) -> None:
+        """Collect RTensors, optionally separating immutable multimodal fields."""
         if isinstance(obj, RTensor):
             result.append(obj)
+        elif isinstance(obj, dict) and vision_refs is not None:
+            from areal.utils.data import is_multi_modal_key
+
+            for k, v in obj.items():
+                if isinstance(k, str) and is_multi_modal_key(k):
+                    RTensor._collect_all(v, vision_refs)
+                else:
+                    RTensor._collect_all(v, result, vision_refs)
         elif isinstance(obj, dict):
             for v in obj.values():
                 RTensor._collect_all(v, result)
         elif isinstance(obj, (list, tuple)):
             for item in obj:
-                RTensor._collect_all(item, result)
+                RTensor._collect_all(item, result, vision_refs)
 
     @staticmethod
     def _localize_recursive(obj: Any) -> Any:
