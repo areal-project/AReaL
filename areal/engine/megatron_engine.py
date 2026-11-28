@@ -3905,6 +3905,9 @@ class MegatronEngine(TrainEngine):
 class MegatronPPOActor(MegatronEngine):
     """PPO Actor implementation using Megatron backend."""
 
+    # Both methods read the rollout's vision tensors without modifying them.
+    shared_vision_rpc_methods = frozenset({"compute_logp", "ppo_update"})
+
     def __init__(self, config: PPOActorConfig):
         from areal.trainer.ppo.actor import PPOActor
 
