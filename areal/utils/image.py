@@ -2,9 +2,10 @@
 
 import base64
 import binascii
+from contextlib import suppress
 from io import BytesIO
 
-from PIL import Image
+from PIL import Image, ImageOps
 from PIL.Image import Image as ImageObject
 
 
@@ -26,8 +27,7 @@ def image2base64(images: list[ImageObject] | ImageObject) -> list[str]:
 def base642image(images: list[str] | str) -> list[ImageObject]:
     """Decode base64 image payloads (without data-URI prefix) into PIL images.
 
-    Inverse of :func:`image2base64`. Images are converted to RGB so that
-    downstream HuggingFace processors receive a consistent mode.
+    Match vLLM's default RGB decoder for EXIF orientation and transparency.
     """
     if isinstance(images, str):
         images = [images]
@@ -41,8 +41,18 @@ def base642image(images: list[str] | str) -> list[ImageObject]:
         with BytesIO(raw) as buffer:
             image = Image.open(buffer)
             image.load()
+            # vLLM ignores unreadable EXIF. In-place avoids copying upright images.
+            with suppress(Exception):
+                ImageOps.exif_transpose(image, in_place=True)
         if image.mode != "RGB":
-            image = image.convert("RGB")
+            if image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info:
+                if image.mode != "RGBA":
+                    image = image.convert("RGBA")
+                background = Image.new("RGB", image.size, "white")
+                background.paste(image, mask=image.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
         decoded.append(image)
 
     return decoded

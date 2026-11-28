@@ -8,10 +8,14 @@ vision-expanded, the exported tensor dict must carry ``multi_modal_input`` and
 serialization without shipping one copy of ``pixel_values`` per turn.
 """
 
+import base64
 import json
+from io import BytesIO
+from unittest.mock import patch
 
 import pytest
 import torch
+from PIL import Image, ImageOps
 
 from tests.experimental.openai.vision_stubs import (
     EOS_ID,
@@ -70,11 +74,16 @@ def processor():
 
 
 def test_base642image_round_trips_image2base64():
-    """Test that base642image inverts image2base64 for RGB images."""
+    """Upright RGB pixels round-trip without an extra decoded image copy."""
     original = make_image(42)
+    encoded = image2base64(original)
 
-    decoded = base642image(image2base64(original))
+    with patch.object(
+        Image.Image, "copy", autospec=True, side_effect=Image.Image.copy
+    ) as copy:
+        decoded = base642image(encoded)
 
+    copy.assert_not_called()
     assert len(decoded) == 1
     assert decoded[0].mode == "RGB"
     assert decoded[0].size == original.size
@@ -83,13 +92,65 @@ def test_base642image_round_trips_image2base64():
 
 def test_base642image_converts_non_rgb_to_rgb():
     """Test that base642image normalises mode so processors get consistent input."""
-    from PIL import Image
-
     grayscale = Image.new("L", (4, 4), 200)
 
     decoded = base642image(image2base64(grayscale))
 
     assert decoded[0].mode == "RGB"
+
+
+@pytest.mark.parametrize("orientation", [1, 3, 6])
+def test_base642image_jpeg_matches_exif_orientation(orientation):
+    """The proxy and vLLM must present the same displayed pixels to their processors."""
+    image = Image.new("RGB", (16, 8), "red")
+    image.paste("blue", (8, 0, 16, 8))
+    exif = Image.Exif()
+    exif[274] = orientation
+    with BytesIO() as buffer:
+        image.save(buffer, format="JPEG", exif=exif)
+        encoded = base64.b64encode(buffer.getvalue()).decode()
+        with Image.open(buffer) as jpeg:
+            expected = ImageOps.exif_transpose(jpeg)
+
+    (decoded,) = base642image(encoded)
+
+    assert decoded.size == expected.size
+    assert decoded.tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("mode", ["RGB", "L"])
+def test_base642image_composites_alpha_on_white(mode):
+    """RGBA and LA pixels blend with vLLM's default white background."""
+    image = Image.new("L", (3, 1), 45).convert(mode)
+    alpha = Image.new("L", image.size)
+    alpha.putdata([0, 128, 255])
+    image.putalpha(alpha)
+
+    (decoded,) = base642image(image2base64(image))
+
+    assert decoded.mode == "RGB"
+    assert [decoded.getpixel((x, 0)) for x in range(3)] == [
+        (255, 255, 255),
+        (150, 150, 150),
+        (45, 45, 45),
+    ]
+
+
+@pytest.mark.parametrize("mode", ["P", "L", "RGB"])
+def test_base642image_png_transparency_key_matches_vllm(mode):
+    """vLLM leaves RGB pixels intact and composites tRNS for other modes."""
+    image = Image.new("L", (2, 1))
+    image.putdata([45, 16])
+    image = image.convert(mode)
+    image.info["transparency"] = (45, 45, 45) if mode == "RGB" else 45
+
+    (decoded,) = base642image(image2base64(image))
+
+    assert decoded.mode == "RGB"
+    assert decoded.getpixel((0, 0)) == (
+        (45, 45, 45) if mode == "RGB" else (255, 255, 255)
+    )
+    assert decoded.getpixel((1, 0)) == (16, 16, 16)
 
 
 def test_base642image_rejects_invalid_base64():
