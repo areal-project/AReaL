@@ -277,7 +277,8 @@ def test_successful_flush_accepts_uninitialized_image_cache(monkeypatch):
     assert scheduler.flush_cache() is True
 
 
-def test_tms_hook_mode_stays_preload_after_initialization(monkeypatch):
+@pytest.mark.parametrize("weftmoe,graphs", [("0", "1"), ("1", "0")])
+def test_tms_hook_mode_stays_preload_after_initialization(monkeypatch, weftmoe, graphs):
     import sys
 
     class Saver:
@@ -296,7 +297,8 @@ def test_tms_hook_mode_stays_preload_after_initialization(monkeypatch):
     monkeypatch.setitem(
         sys.modules, "torch_memory_saver", SimpleNamespace(torch_memory_saver=saver)
     )
-    monkeypatch.setenv("SGLANG_MEMORY_SAVER_CUDA_GRAPH", "1")
+    monkeypatch.setenv("SGLANG_MEMORY_SAVER_CUDA_GRAPH", graphs)
+    monkeypatch.setenv("AREAL_USE_WEFTMOE", weftmoe)
 
     patch_tms_hook_mode()
     saver.hook_mode = "torch"
@@ -846,9 +848,43 @@ def test_qwen_frozen_verification_precedes_worker_start(monkeypatch, invalid):
         assert calls == ["verify", "start", "loop"]
 
 
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("tags", [["weights"], ["kv_cache"], None])
+def test_weftmoe_release_discards_only_fp8_receive_buffers(monkeypatch, fp8, tags):
+    import sys
+
+    calls = []
+    runner = object()
+    monkeypatch.setenv("AREAL_USE_WEFTMOE", "1")
+    monkeypatch.setenv("WEFTMOE_FP8", "1" if fp8 else "0")
+    monkeypatch.setitem(
+        sys.modules,
+        "weftmoe.sglang",
+        SimpleNamespace(
+            suspend=lambda model, **kwargs: calls.append((model, kwargs)),
+        ),
+    )
+    scheduler = SimpleNamespace(
+        tp_worker=SimpleNamespace(model_runner=runner),
+        release_memory_occupation=lambda request: calls.append("release"),
+        resume_memory_occupation=lambda request: None,
+    )
+    plugin = AwexSchedulerPlugin(scheduler)
+    plugin._receiver = SimpleNamespace(
+        release_fp8_bindings=lambda: calls.append("unbind"),
+    )
+    plugin._patch_memory_transitions()
+    scheduler.release_memory_occupation(SimpleNamespace(tags=tags))
+    discard = fp8 and (tags is None or "weights" in tags)
+    assert calls == ["unbind", (runner, {"discard_fp8": discard}), "release"]
+
+
 @pytest.mark.parametrize("separate_updater", [False, True])
 @pytest.mark.parametrize("tags", [["weights"], None, []])
-def test_native_memory_dispatch_restores_frozen_draft(separate_updater, tags):
+@pytest.mark.parametrize("weftmoe", [False, True])
+def test_native_memory_dispatch_restores_frozen_draft(
+    monkeypatch, separate_updater, tags, weftmoe
+):
     """Native dispatch restores private buffers without reverting shared updates."""
     target = torch.nn.Linear(4, 4, bias=False)
     draft = torch.nn.Linear(4, 4, bias=False)
@@ -857,6 +893,20 @@ def test_native_memory_dispatch_restores_frozen_draft(separate_updater, tags):
     expected = draft.weight.detach().clone()
     derived = draft.derived.clone()
     pointers = draft.weight.data_ptr(), draft.derived.data_ptr()
+
+    captured = []
+
+    def resume(runner):
+        torch.testing.assert_close(draft.weight, expected, rtol=0, atol=0)
+        torch.testing.assert_close(draft.derived, derived, rtol=0, atol=0)
+        captured.append(runner)
+
+    monkeypatch.setenv("AREAL_USE_WEFTMOE", "1" if weftmoe else "0")
+    monkeypatch.setitem(
+        sys.modules,
+        "weftmoe.sglang",
+        SimpleNamespace(suspend=lambda runner, **kwargs: None, resume=resume),
+    )
 
     class Request:
         def __init__(self, tags):
@@ -896,3 +946,4 @@ def test_native_memory_dispatch_restores_frozen_draft(separate_updater, tags):
         torch.testing.assert_close(draft.derived, derived, rtol=0, atol=0)
         torch.testing.assert_close(draft.shared, target.weight, rtol=0, atol=0)
         assert pointers == (draft.weight.data_ptr(), draft.derived.data_ptr())
+    assert captured == ([scheduler.tp_worker.model_runner] * 3 if weftmoe else [])
