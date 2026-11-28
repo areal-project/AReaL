@@ -53,7 +53,6 @@ class CommittedMaskRows:
 
 @dataclass
 class VerifyPolicy:
-    target_probs: torch.Tensor
     logprobs: torch.Tensor
     rows: CommittedMaskRows
 
@@ -81,9 +80,5 @@ def prepare_verify_policy(logits, info, stride, bound, producer, versions, lease
         info.top_ks.repeat_interleave(stride),
         candidate_bound=bound,
     )
-    # DSpark's rejection kernel takes dense target probabilities. Keep the compact
-    # representation for selected logp and publishing, with no second filtering pass.
-    probs = torch.zeros_like(logits, dtype=torch.float32)
-    probs.scatter_(1, ids.long(), logp.exp())
     rows = CommittedMaskRows(producer, ids, counts, versions, leases, stride)
-    return VerifyPolicy(probs.view(-1, stride, logits.shape[-1]), logp, rows)
+    return VerifyPolicy(logp, rows)

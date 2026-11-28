@@ -8,12 +8,8 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     SoftmaxTemp,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import BuildOutTokens
-from sglang.kernels.ops.speculative.reject_sampling import (
-    chain_speculative_sampling_triton,
-)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.dflash_utils import _get_or_create_chain_verify_buffers
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     AcceptOuts,
     TargetVerifyExecutor,
@@ -21,39 +17,25 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 
+from areal.engine.sglang_dspark_sampling import sample_chain
 
-def accept_joint_chain(candidates, target_probs, draft_probs, verify_lens=None):
-    bs, width, _ = target_probs.shape
-    device = candidates.device
-    index, child, sibling, tokens, accept_index, accepted = (
-        _get_or_create_chain_verify_buffers(bs=bs, draft_token_num=width, device=device)
+
+def accept_joint_chain(candidates, policy, draft_probs, verify_lens=None):
+    proposals = candidates[:, 1:]
+    uniforms = torch.rand(
+        candidates.shape, device=candidates.device, dtype=torch.float32
     )
-    chain_speculative_sampling_triton(
-        predicts=tokens,
-        accept_index=accept_index,
-        accept_token_num=accepted,
-        candidates=candidates,
-        retrive_index=index,
-        retrive_next_token=child,
-        retrive_next_sibling=sibling,
-        uniform_samples=torch.rand((bs, width - 1), dtype=torch.float32, device=device),
-        uniform_samples_for_final_sampling=torch.rand(
-            (bs,), dtype=torch.float32, device=device
-        ),
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=1.0,
-        threshold_acc=1.0,
-        deterministic=True,
-    )
+    accepted, bonus = sample_chain(proposals, policy, draft_probs, uniforms)
     if verify_lens is None:
-        trimmed = torch.zeros_like(accepted)
-    else:
-        accepted, trimmed = CapCorrectLen.execute(
-            correct_len=accepted, verify_lens=verify_lens
-        )
-    pos = accept_index[torch.arange(bs, device=device), accepted.long()].long()
-    return accepted, tokens[pos].long(), trimmed
+        return accepted, bonus, torch.zeros_like(accepted)
+    accepted, trimmed = CapCorrectLen.execute(
+        correct_len=accepted, verify_lens=verify_lens
+    )
+    # At a capped boundary the next already-accepted proposal is the bonus.
+    next_proposal = proposals.gather(
+        1, accepted.long().clamp_max(proposals.shape[1] - 1)[:, None]
+    ).squeeze(1)
+    return accepted, torch.where(trimmed > 0, next_proposal, bonus), trimmed
 
 
 class JointVerifyExecutor(TargetVerifyExecutor):
@@ -102,7 +84,7 @@ class JointVerifyExecutor(TargetVerifyExecutor):
         ).view_as(logits)
         accepted, bonus, trimmed = accept_joint_chain(
             verify_ids_2d,
-            policy.target_probs,
+            policy,
             draft_probs,
             layout.verify_lens if layout is not None else None,
         )

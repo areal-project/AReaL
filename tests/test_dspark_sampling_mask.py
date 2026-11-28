@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from areal.engine.sglang_dspark_policy import prepare_verify_policy
+from areal.engine.sglang_dspark_policy import (
+    CommittedMaskRows,
+    VerifyPolicy,
+    prepare_verify_policy,
+)
 from areal.engine.sglang_sampling_mask import candidate_distribution
 
 
@@ -48,7 +52,9 @@ def make_policy(device):
 
 def test_dspark_target_matches_full_vocab_joint_and_decode():
     logits, info, policy, _ = make_policy("cpu")
-    p = policy.target_probs.view_as(logits)
+    p = torch.zeros_like(logits).scatter_(
+        1, policy.rows.ids.long(), policy.logprobs.exp()
+    )
     for row in range(len(logits)):
         req = row // 3
         scaled = logits[row].double() / info.temperatures[req]
@@ -79,6 +85,47 @@ def test_dspark_target_matches_full_vocab_joint_and_decode():
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="DSpark chain kernel requires CUDA"
 )
+@pytest.mark.parametrize("reject", [True, False])
+@pytest.mark.parametrize("k", [4, 2049])
+def test_dspark_sparse_final_draw(reject, k):
+    from areal.engine.sglang_dspark_sampling import sample_chain
+
+    device = "cuda"
+    # Check every quantile of p and (p-q)+, including the two attainable RNG
+    # endpoints, with zero mass on both a retained ID and a padded column.
+    n = 256
+    support = torch.tensor([3, 7, 5, 1], device=device)
+    prob = torch.tensor([0.5, 0.375, 0.125, 0.0], device=device)
+    if k > 4:
+        # The last positive interval lies in a different kernel tile.
+        support = torch.arange(k, device=device)
+        support[[0, 3, 1, 7, 5, k - 1]] = support[[3, 0, 7, 1, k - 1, 5]]
+        prob = torch.zeros(k, device=device)
+        prob[[0, 1, k - 1]] = torch.tensor([0.5, 0.375, 0.125], device=device)
+    ids = support.repeat(2 * n, 1)
+    policy = VerifyPolicy(
+        prob.log().repeat(2 * n, 1), CommittedMaskRows(None, ids, None, [], [], 2)
+    )
+    draft = torch.zeros(n, 1, max(8, k), device=device)
+    draft[:, :, 3] = 0.75
+    draft[:, :, 0] = 0.25
+    proposals = torch.full((n, 1), 3, device=device)
+    u = (torch.arange(n, device=device, dtype=torch.float32) + 0.5) / n
+    u[0] = 0.0
+    u[-1] = 1.0 - 2**-24
+    coins = torch.stack([torch.full_like(u, 0.9 if reject else 0.25), u], dim=1)
+    accepted, final = sample_chain(proposals, policy, draft, coins)
+    assert (accepted == (0 if reject else 1)).all()
+    if reject:
+        expected = torch.where(u < 0.75, 7, 5)
+    else:
+        expected = torch.where(u < 0.5, 3, torch.where(u < 0.875, 7, 5))
+    assert torch.equal(final, expected)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="DSpark chain kernel requires CUDA"
+)
 def test_dspark_accept_replacement_bonus_and_visible_commits(dspark_runtime):
     from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
         BuildOutTokens,
@@ -88,7 +135,11 @@ def test_dspark_accept_replacement_bonus_and_visible_commits(dspark_runtime):
     from areal.engine.sglang_dspark_worker import accept_joint_chain
 
     logits, info, policy, producer = make_policy("cuda")
-    p = policy.target_probs
+    p = (
+        torch.zeros_like(logits)
+        .scatter_(1, policy.rows.ids.long(), policy.logprobs.exp())
+        .view(3, 3, -1)
+    )
     draft = p[:, :2].contiguous().clone()
     proposed = draft.argmax(-1)
     for b, j in [(0, 0), (1, 1)]:
@@ -96,7 +147,7 @@ def test_dspark_accept_replacement_bonus_and_visible_commits(dspark_runtime):
         proposed[b, j] = (proposed[b, j] + 64) % 128
         draft[b, j].zero_().scatter_(0, proposed[b, j : j + 1], 1.0)
     candidates = torch.cat([torch.zeros_like(proposed[:, :1]), proposed], dim=1)
-    accepted, bonus, _ = accept_joint_chain(candidates, p, draft)
+    accepted, bonus, _ = accept_joint_chain(candidates, policy, draft)
     assert accepted.tolist() == [0, 1, 2]
     tokens = BuildOutTokens.execute(
         draft_tokens=proposed,
@@ -133,6 +184,31 @@ def test_dspark_accept_replacement_bonus_and_visible_commits(dspark_runtime):
             atol=1e-5,
             rtol=0,
         )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="DSpark chain kernel requires CUDA"
+)
+def test_dspark_capped_verified_prefix_keeps_next_accepted_token(dspark_runtime):
+    from areal.engine.sglang_dspark_worker import accept_joint_chain
+
+    logits, _, policy, _ = make_policy("cuda")
+    draft = (
+        torch.zeros_like(logits)
+        .scatter_(1, policy.rows.ids.long(), policy.logprobs.exp())
+        .view(3, 3, -1)[:, :-1]
+    )
+    proposals = draft.argmax(-1)
+    candidates = torch.cat([torch.zeros_like(proposals[:, :1]), proposals], dim=1)
+    accepted, bonus, trimmed = accept_joint_chain(
+        candidates,
+        policy,
+        draft,
+        verify_lens=torch.tensor([1, 2, 3], device=draft.device),
+    )
+    assert accepted.tolist() == [0, 1, 2]
+    assert trimmed.tolist() == [2, 1, 0]
+    assert torch.equal(bonus[:2], proposals[[0, 1], [0, 1]])
 
 
 def test_native_algorithm_preserves_dspark_contract(dspark_runtime, monkeypatch):
