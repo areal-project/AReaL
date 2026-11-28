@@ -375,7 +375,7 @@ A_t = \delta_t + \gamma \lambda A_{t+1}, \qquad
 G_t = A_t + V_t,
 $$
 
-其中$\gamma$为`actor.discount`，$\lambda$为`actor.gae_lambda`配置解析出的逐轨迹取值。奖励$r_t$包含结果奖励增量和token级KL惩罚。以EOS结束的轨迹使用0作为终止bootstrap；没有EOS的截断轨迹则使用最后一个value估计进行bootstrap。
+其中$\gamma$为`actor.discount`，$\lambda$为`actor.gae_lambda`配置解析出的逐轨迹取值。奖励$r_t$包含结果奖励增量和token级KL惩罚。以EOS结束的轨迹，以及保留终局奖励的截断轨迹（默认`actor.mask_no_eos_with_zero=False`），均使用0作为终止bootstrap；仅当`actor.mask_no_eos_with_zero=True`将截断轨迹的终局奖励置0时，才使用最后一个value估计进行bootstrap。
 
 #### Turn级GAE
 
