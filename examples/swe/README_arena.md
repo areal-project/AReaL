@@ -256,6 +256,43 @@ outcome codes, `task_attempt_count`, and `task_result_count`. Each Arena stream 
 own denominator. `<name>` is the dataset's `arena_stream_name`, falling back to
 `stream_id` for rows without a configured name.
 
+The scalar series `rollout/error_rate/{arena,model,unknown}` divide each origin's
+failure count by `rollout/task_attempt_count`. Each Arena agent call contributes once
+when it exits. Local cancellation adds one attempt and zero errors. The per-stream rates
+use `rollout/stream/<name>/task_attempt_count`. Retries inside a call and subsequent
+proxy reward recovery do not add attempts. Proxy setup, session close, and trajectory
+export are outside this measurement. If the deadline expires during launch or result
+polling, the latest observed OpenAPI failure determines attribution. A successful
+response clears that evidence. Recovering from an HTTP or network error adds zero
+failures.
+
+Each origin exposes `rollout/error_rate/<origin>_reason/<reason>` as a fraction of
+**all** consumed attempts. Reasons partition their origin globally and per stream:
+
+| Origin  | Reasons                                                                                                                                                                     |
+| ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Arena   | `setup_failed`, `collect_failed`, `eval_failed`, `failed`, `grader_reported_error`, `openapi_error_<code>`, `openapi_error_other`, `openapi_network_error`, `sandbox_error` |
+| Model   | `empty_completion`, `invalid_tool_json`, `tool_call_argument_bytes_exceeded`, `context_window_exceeded`, `output_token_limit`, `max_turns_exceeded`, `other_model_error`    |
+| Unknown | `harness_failed`, `timeout`, `no_output`, `cancelled`, `local_wait_timeout`, `client_error`, `other`                                                                        |
+
+Arena reports separate rates for HTTP 302, 400, 401, 403, 404, 408, 409, 422, 429, 500,
+502, 503, and 504. All remaining HTTP codes use `openapi_error_other`. Recognized
+Spanner redirects use the upstream 502 or 504. Network exceptions share one reason. An
+explicitly failed ARCA operation with a 4xx response also counts as a sandbox failure.
+Remote sandbox failures share `sandbox_error`. The worker log retains the detailed
+reason (including the original Spanner marker, ARCA reason, or HTTPX exception class). A
+remote `CANCELLED` with no further evidence counts under `unknown_reason/cancelled`;
+local cancellation only contributes to the denominator.
+
+For individual failures, search the worker log for `Arena rollout failure` and join on
+`task_id` and `sample_idx`. The log includes the Arena task ID when available,
+`metric_reason`, `exception_type`, `error_origin`, and the detailed `error_reason`.
+Top-level `SETUP_FAILED`, `COLLECT_FAILED`, `EVAL_FAILED`, `FAILED`, and grader-reported
+`ERROR` count as Arena failures. For `HARNESS_FAILED`, `TIMEOUT`, and `NO_OUTPUT`, use
+gateway or sandbox evidence for Arena attribution and a verified model receipt for model
+attribution. An inner Harness `ERROR` alone does not establish a grader error. Other
+failures, including ambiguous Harness failures and training-side faults, use `unknown`.
+
 Per-Arena-stream `accepted_count`, `rejected_count`, and `group_attempt_count` count
 prompt groups consumed while forming the current batch, including failed attempts.
 `filter_rejected_count` counts only groups for which `should_accept_fn` returned false;

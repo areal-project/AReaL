@@ -26,6 +26,7 @@ from examples.swe.arena_client import (
     ArenaAPIError,
     ArenaOpenAPIClient,
     ArenaTaskFailedError,
+    ArenaTaskRequestState,
     ArenaTaskResult,
     LLMProtocol,
     infer_llm_protocol_from_harness,
@@ -91,6 +92,82 @@ _HARNESS_SYSTEM_ERROR_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _GAMEAGENT_OUTCOME_METRIC_CODES = tuple(sorted(HARNESS_OUTCOME_METRIC_CODES))
+_OPENAPI_HTTP_CODES = (302, 400, 401, 403, 404, 408, 409, 422, 429, 500, 502, 503, 504)
+_ARENA_PHASE_FAILURES = ("SETUP_FAILED", "COLLECT_FAILED", "EVAL_FAILED", "FAILED")
+_REASON_ALIASES = {
+    "arena": {
+        "spanner_apigwmoe_502": "openapi_error_502",
+        "spanner_arenaonlinegateway_504": "openapi_error_504",
+    },
+    "model": {
+        "llm_context_window_exceeded": "context_window_exceeded",
+        "llm_output_token_limit_exceeded": "output_token_limit",
+        "agent_max_turns_exceeded": "max_turns_exceeded",
+    },
+}
+_ERROR_REASON_BUCKETS = {
+    "arena": (
+        *(status.lower() for status in _ARENA_PHASE_FAILURES),
+        "grader_reported_error",
+        *(f"openapi_error_{code}" for code in _OPENAPI_HTTP_CODES),
+        "openapi_error_other",
+        "openapi_network_error",
+        "sandbox_error",
+    ),
+    "model": (
+        "empty_completion",
+        "invalid_tool_json",
+        "tool_call_argument_bytes_exceeded",
+        "context_window_exceeded",
+        "output_token_limit",
+        "max_turns_exceeded",
+        "other_model_error",
+    ),
+    "unknown": (
+        "harness_failed",
+        "timeout",
+        "no_output",
+        "cancelled",
+        "local_wait_timeout",
+        "client_error",
+        "other",
+    ),
+}
+
+# A completed attempt contributes either one or zero to every published rate.
+_ZERO_ERROR_RATES = {f"error_rate/{origin}": 0.0 for origin in _ERROR_REASON_BUCKETS}
+_ZERO_ERROR_RATES.update(
+    {
+        f"error_rate/{origin}_reason/{reason}": 0.0
+        for origin, reasons in _ERROR_REASON_BUCKETS.items()
+        for reason in reasons
+    }
+)
+
+
+def _error_reason_bucket(origin: str, reason: str) -> str:
+    label = reason.lower()
+    label = _REASON_ALIASES.get(origin, {}).get(label, label)
+    if label in _ERROR_REASON_BUCKETS[origin]:
+        return label
+    if origin == "arena":
+        if label.startswith("arca_"):
+            return "sandbox_error"
+        if label.startswith("arena_openapi_http_"):
+            bucket = f"openapi_error_{label.removeprefix('arena_openapi_http_')}"
+            return (
+                bucket
+                if bucket in _ERROR_REASON_BUCKETS["arena"]
+                else "openapi_error_other"
+            )
+        return "openapi_network_error"
+    if origin == "model":
+        return "other_model_error"
+    if label == "arenaapierror" or label.startswith("arena_openapi_"):
+        return "client_error"
+    return "other"
+
+
 _WORKER_GATEWAY_REGISTRY_ATTR = "_arena_session_gateway_registry_v1"
 _WORKER_GATEWAY_CLEANUP_KEY = "arena-session-gateway-registrations"
 _PROXY_INVALID_TOOL_JSON_MESSAGE = InvalidToolCallError.message.encode("utf-8")
@@ -500,10 +577,24 @@ def _arena_task_type(data: dict[str, Any]) -> str:
     return arena_task_type.strip()
 
 
+class _ArenaLaunchTimeout(TimeoutError):
+    """Launch deadline with an observed OpenAPI failure but no confirmed task."""
+
+    def __init__(self, reason: str) -> None:
+        self.arena_failure_reason = reason
+        super().__init__(f"Arena launch deadline expired after {reason}")
+
+
 class _ArenaTaskWaitTimeout(TimeoutError):
     """The local result deadline expired after a confirmed Arena task launch."""
 
-    def __init__(self, task_id: str, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        task_id: str,
+        timeout_seconds: float,
+        gateway_failure_reason: str | None = None,
+    ) -> None:
+        self.arena_failure_reason = gateway_failure_reason
         self.task_id = task_id
         self.timeout_seconds = timeout_seconds
         super().__init__(
@@ -514,11 +605,14 @@ class _ArenaTaskWaitTimeout(TimeoutError):
 class ArenaStreamAgentWorkflow:
     """Launch an Arena online task and use its returned reward for RL."""
 
-    _SYSTEM_FAILURE_STATUSES = ArenaOpenAPIClient.FAILED_TASK_STATUSES - {
+    _AMBIGUOUS_FAILURE_STATUSES = {
         "HARNESS_FAILED",
         "NO_OUTPUT",
         "TIMEOUT",
     }
+    _SYSTEM_FAILURE_STATUSES = (
+        ArenaOpenAPIClient.FAILED_TASK_STATUSES - _AMBIGUOUS_FAILURE_STATUSES
+    )
 
     def __init__(
         self,
@@ -1378,17 +1472,18 @@ class ArenaStreamAgentWorkflow:
 
     @classmethod
     def _harness_failure_reason(cls, error: BaseException | None) -> str | None:
-        """Identify verified model failure causes before trajectory filtering.
-
-        The metric describes the Harness cause, not whether the proxy can export
-        usable interactions. Reuse admission checks to exclude unhealthy receipts.
-        """
         if (
             not isinstance(error, ArenaTaskFailedError)
             or error.status != "HARNESS_FAILED"
-            or error.result is None
             or not cls._is_model_attributed_harness_failure(error)
         ):
+            return None
+        return cls._model_receipt_detail(error)
+
+    @classmethod
+    def _model_receipt_detail(cls, error: ArenaTaskFailedError) -> str | None:
+        """Read the specific cause after the model receipt has passed validation."""
+        if error.result is None:
             return None
         raw = error.result.raw
         result_format = cls._harness_result_format(raw)
@@ -1413,6 +1508,10 @@ class ArenaStreamAgentWorkflow:
                 return "tool_call_argument_bytes_exceeded"
             if message == "model stopped without visible output or tool calls":
                 return "empty_completion"
+            if message == "model stopped with reason: length":
+                return "output_token_limit"
+            if message.startswith("context window limit exceeded:"):
+                return "context_window_exceeded"
         return None
 
     @classmethod
@@ -1859,6 +1958,99 @@ class ArenaStreamAgentWorkflow:
             metadata["auxiliary_system_prompts"] = list(auxiliary_prompts)
         return metadata
 
+    def _attempt_error_metrics(
+        self,
+        data: dict[str, Any],
+        error: BaseException | None,
+        model_reason: str | None,
+    ) -> dict[str, float]:
+        """Classify the completed Arena call before any proxy post-processing."""
+        metrics = _ZERO_ERROR_RATES.copy()
+        if error is None or isinstance(error, asyncio.CancelledError):
+            return metrics
+
+        origin, reason = self._classify_attempt_error(error, model_reason)
+        bucket = _error_reason_bucket(origin, reason)
+        context = workflow_context.get()
+        result = self._task_result.get()
+        logger.warning(
+            "Arena rollout failure: task_id=%s sample_idx=%s arena_task_id=%s "
+            "data_id=%s metric_reason=%s exception_type=%s error_origin=%s error_reason=%s",
+            context.task_id,
+            context.sample_idx,
+            getattr(error, "task_id", None) or (result.task_id if result else None),
+            data.get("data_id"),
+            bucket,
+            type(error.__cause__ or error).__name__,
+            origin,
+            reason,
+        )
+        metrics[f"error_rate/{origin}"] = 1.0
+        metrics[f"error_rate/{origin}_reason/{bucket}"] = 1.0
+        return metrics
+
+    @classmethod
+    def _classify_attempt_error(
+        cls, error: BaseException, model_reason: str | None
+    ) -> tuple[str, str]:
+        if isinstance(error, ArenaTaskFailedError) and error.status == "ERROR":
+            return "arena", "grader_reported_error"
+        arena_reason = cls._arena_failure_evidence(error)
+        if arena_reason:
+            return "arena", arena_reason
+        if isinstance(error, ArenaTaskFailedError):
+            if error.status in _ARENA_PHASE_FAILURES:
+                return "arena", error.status
+            if model_reason:
+                return "model", model_reason
+            return "unknown", error.status
+        if isinstance(error, _ArenaTaskWaitTimeout):
+            return "unknown", "local_wait_timeout"
+        if isinstance(error, ArenaAPIError):
+            cause = error.__cause__
+            if isinstance(cause, httpx.HTTPStatusError):
+                return "unknown", f"arena_openapi_http_{cause.response.status_code}"
+            if isinstance(cause, httpx.RequestError):
+                return "unknown", f"arena_openapi_{type(cause).__name__}"
+        return "unknown", type(error).__name__
+
+    @staticmethod
+    def _arena_failure_evidence(error: BaseException | None) -> str | None:
+        if (
+            isinstance(
+                error, (ArenaAPIError, _ArenaLaunchTimeout, _ArenaTaskWaitTimeout)
+            )
+            and error.arena_failure_reason
+        ):
+            return error.arena_failure_reason
+        if not isinstance(error, ArenaTaskFailedError) or error.result is None:
+            return None
+        raw = error.result.raw
+        if not isinstance(raw, dict):
+            return None
+        arca = raw.get("arca")
+        status = arca.get("http_status") if isinstance(arca, dict) else None
+        if isinstance(status, int) and (
+            500 <= status < 600
+            or (
+                400 <= status < 500
+                and arca.get("success") is False
+                and isinstance(arca.get("operation"), str)
+                and arca["operation"].strip()
+            )
+        ):
+            return f"arca_http_{status}"
+        detail = raw.get("error")
+        if isinstance(detail, str):
+            match = re.match(
+                r"(?:reward exec|adopted reward|shared reward [a-z ]+) "
+                r"\((exec_eof|http_5xx|exec_timeout|create_pending_timeout|timeout)\):",
+                detail,
+            )
+            if match:
+                return f"arca_{match[1]}"
+        return None
+
     async def record_failure_disposition(
         self,
         data: dict[str, Any],
@@ -1944,13 +2136,30 @@ class ArenaStreamAgentWorkflow:
         Keep them in the call denominator, outside the terminal-result denominator.
         """
         cancelled = isinstance(error, asyncio.CancelledError)
-        failure_reason = self._harness_failure_reason(error)
+        model_reason = failure_reason = None
+        if (
+            isinstance(error, ArenaTaskFailedError)
+            and error.status in self._AMBIGUOUS_FAILURE_STATUSES
+            and self._is_model_attributed_harness_failure(error)
+        ):
+            model_reason = self._model_receipt_detail(error)
+            if error.status == "HARNESS_FAILED":
+                failure_reason = model_reason
+            if model_reason is None:
+                raw = error.result.raw if error.result else None
+                model_reason = (
+                    self._gameagent_outcome_code(raw)
+                    or "model_attributed_harness_failure"
+                )
         self._task_failure_reason.set(failure_reason)
-        metrics = {
-            "task_attempt/success": float(error is None),
-            "task_attempt/error": float(error is not None and not cancelled),
-            "task_attempt/cancelled": float(cancelled),
-        }
+        metrics = self._attempt_error_metrics(data, error, model_reason)
+        metrics.update(
+            {
+                "task_attempt/success": float(error is None),
+                "task_attempt/error": float(error is not None and not cancelled),
+                "task_attempt/cancelled": float(cancelled),
+            }
+        )
         result = self._task_result.get()
         status = result.status if result is not None else None
         if isinstance(error, ArenaTaskFailedError):
@@ -2240,6 +2449,7 @@ class ArenaStreamAgentWorkflow:
             if stream_config.reward_mapping_file:
                 ref = self._expected_reward_ref(data, stream_config)
                 reward_kwargs["reward"] = f"{ref.key}@{ref.version}"
+            request_state = ArenaTaskRequestState()
             task_deadline = asyncio.timeout(self.timeout)
             try:
                 async with task_deadline:
@@ -2256,6 +2466,7 @@ class ArenaStreamAgentWorkflow:
                         metadata=task_metadata,
                         client=client,
                         on_launch_success=record_launch_success,
+                        task_request_state=request_state,
                         **reward_kwargs,
                     )
             except ArenaTaskFailedError as exc:
@@ -2263,7 +2474,7 @@ class ArenaStreamAgentWorkflow:
                 _record_arena_metrics(**{"arena/call_success": 0.0})
                 if exc.result is not None:
                     self._task_result.set(exc.result)
-                    if exc.status == "HARNESS_FAILED" and (
+                    if exc.status in self._AMBIGUOUS_FAILURE_STATUSES and (
                         self._harness_result_format(exc.result.raw) == "native-runner"
                         or self._is_abbreviated_whitebox_failure(exc.result.raw)
                         or self._core_model_zero_failure_message(exc.result.raw)
@@ -2344,7 +2555,15 @@ class ArenaStreamAgentWorkflow:
                     self.timeout,
                 )
                 if launch_recorded and launched_task_id:
-                    raise _ArenaTaskWaitTimeout(launched_task_id, self.timeout) from exc
+                    raise _ArenaTaskWaitTimeout(
+                        launched_task_id,
+                        self.timeout,
+                        request_state.gateway_failure_reason,
+                    ) from exc
+                if request_state.gateway_failure_reason:
+                    raise _ArenaLaunchTimeout(
+                        request_state.gateway_failure_reason
+                    ) from exc
                 raise
             except Exception:
                 if launch_recorded:
