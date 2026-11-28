@@ -2373,7 +2373,7 @@ class FSDPEngine(TrainEngine):
                         "Score centering requires ordinary FSDP sequences."
                     )
                 from areal.utils.score_centering import (
-                    resolve_score_centering_tis_cap,
+                    resolve_score_centering_rejection,
                     score_centering_logprobs,
                 )
 
@@ -2402,7 +2402,7 @@ class FSDPEngine(TrainEngine):
                     ids,
                     q,
                     chunk_size=self.config.logprobs_chunk_size,
-                    tis_cap=resolve_score_centering_tis_cap(
+                    **resolve_score_centering_rejection(
                         getattr(self.config, "rejection_sampling", None)
                     ),
                     tp_group=self.parallel_helper.tp_group

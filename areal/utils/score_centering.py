@@ -2,7 +2,8 @@
 """Head/tail score centering with ordinary PyTorch autograd.
 
 The detached head/tail model follows Score Centering (arXiv:2609.20807)
-and the verl/slime references. The surrogate uses REINFORCE with optional truncated importance sampling.
+and the verl/slime references. The surrogate uses REINFORCE with optional
+truncated (TIS) or masked (IcePop) importance sampling.
 Full logits remain live; log-probabilities are computed in checkpointed chunks.
 """
 
@@ -223,9 +224,32 @@ def vocab_parallel_selected_logprobs(
 
 
 def score_centering_correction(
-    train_head_logp, sampler_head_logp, eps=1e-6, *, tis_cap=None
+    train_head_logp, sampler_head_logp, eps=1e-6, *, tis_cap=None, icepop_bounds=None
 ):
     """Only the final score factor is differentiated; coefficients are detached."""
+    if tis_cap is not None and icepop_bounds is not None:
+        raise ValueError("Select either TIS or IcePop weighting, not both.")
+    if icepop_bounds is not None:
+        lower, upper = _validate_icepop_bounds(icepop_bounds)
+        with torch.no_grad():
+            dtype = (
+                torch.float64
+                if train_head_logp.dtype == torch.float64
+                else torch.float32
+            )
+            head_logp = train_head_logp.to(dtype)
+            q_logp = sampler_head_logp.to(dtype)
+            p, q = head_logp.exp(), q_logp.exp()
+            rho = (1 - q.sum(-1)).clamp_min(0) / (1 - p.sum(-1)).clamp_min(eps)
+            kept = _icepop_kept_mask(head_logp - q_logp, lower, upper)
+            # q_tail = rho * p_tail, so the tail ratio is 1/rho. Compare
+            # reciprocal bounds without dividing by zero when q_tail is zero.
+            tail_kept = (rho > 0) & (rho >= 1 / upper)
+            if lower > 0:
+                tail_kept &= rho <= 1 / lower
+            residual = p * (kept.to(dtype) - tail_kept.unsqueeze(-1).to(dtype))
+        # A zero-probability head has zero coefficient, even if log p is -inf.
+        return (residual * train_head_logp.masked_fill(residual == 0, 0)).sum(-1)
     with torch.no_grad():
         p, q = train_head_logp.exp(), sampler_head_logp.exp()
         # Match the paper: only the denominator needs an epsilon floor.
@@ -252,6 +276,7 @@ def score_centering_logprobs(
     tp_group=None,
     vocab_size=None,
     tis_cap=None,
+    icepop_bounds=None,
 ):
     """Compute sampled log-probabilities, diagnostic entropy, and SC correction."""
     if head_ids.shape != sampler_head_logp.shape:
@@ -266,7 +291,7 @@ def score_centering_logprobs(
             logits, ids, tp_group=tp_group, vocab_size=vocab_size, chunk_size=chunk_size
         )
     correction = score_centering_correction(
-        selected[:, 1:], sampler_head_logp, tis_cap=tis_cap
+        selected[:, 1:], sampler_head_logp, tis_cap=tis_cap, icepop_bounds=icepop_bounds
     )
     return selected[:, 0], entropy, correction
 
@@ -278,11 +303,65 @@ def score_centering_tis_weights(train_logp, sampler_logp, cap):
         return (train_logp - sampler_logp).clamp_max(math.log(cap)).exp().clamp_max(cap)
 
 
+def _validate_icepop_bounds(bounds):
+    if len(bounds) != 2:
+        raise ValueError("Score-centering IcePop needs (lower, upper) bounds.")
+    lower, upper = bounds
+    if (
+        isinstance(lower, bool)
+        or isinstance(upper, bool)
+        or not math.isfinite(lower)
+        or not math.isfinite(upper)
+        or not 0 <= lower <= upper <= torch.finfo(torch.float32).max
+        or upper == 0
+    ):
+        raise ValueError(
+            "Score-centering IcePop bounds must satisfy 0 <= lower <= upper, with finite positive FP32 upper."
+        )
+    return lower, upper
+
+
+def _icepop_kept_mask(log_ratio, lower, upper):
+    kept = log_ratio <= math.log(upper)
+    if lower > 0:
+        kept &= log_ratio >= math.log(lower)
+    return kept
+
+
+def score_centering_icepop_weights(train_logp, sampler_logp, bounds):
+    """Detached p/q inside the inclusive IcePop bounds, zero outside."""
+    lower, upper = _validate_icepop_bounds(bounds)
+    with torch.no_grad():
+        dtype = torch.float64 if train_logp.dtype == torch.float64 else torch.float32
+        log_ratio = train_logp.to(dtype) - sampler_logp.to(dtype)
+        kept = _icepop_kept_mask(log_ratio, lower, upper)
+        # Mask before exponentiating so rejected extreme ratios cannot overflow.
+        return log_ratio.masked_fill(~kept, -torch.inf).exp().clamp_max(upper)
+
+
+def resolve_score_centering_rejection(rejection_sampling):
+    """Resolve existing token-ratio filtering into weighted-SC kernel options.
+
+    IcePop masks only the sampled importance weight. The actor must retain the
+    original loss mask for the correction and its normalization.
+    """
+    if rejection_sampling is None:
+        return {}
+    rs = rejection_sampling
+    if rs.level == "token" and rs.metric == "ratio" and rs.action == "mask":
+        lower = 0.0 if rs.lower is None else rs.lower
+        bounds = _validate_icepop_bounds((lower, rs.upper))
+        if rs.upper <= 1:
+            raise ValueError("Score-centering IcePop upper must be greater than 1.")
+        return {"icepop_bounds": bounds}
+    return {"tis_cap": resolve_score_centering_tis_cap(rs)}
+
+
 def resolve_score_centering_tis_cap(rejection_sampling):
-    """Use AReaL's existing TIS configuration for the weighted SC objective.
+    """Compatibility resolver for callers supporting only unweighted SC or TIS.
 
     SC uses current-trainer / sampler ratios, not decoupled PPO's proximal
-    ratios. Other rejection rules need their own weighted-centering derivation.
+    ratios. Use resolve_score_centering_rejection for IcePop support.
     """
     if rejection_sampling is None:
         return None

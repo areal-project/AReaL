@@ -35,7 +35,7 @@ def _parallel_worker(rank, tp, cp, rendezvous):
         cp_groups = [dist.new_group([t + c * tp for c in range(cp)]) for t in range(tp)]
         t, c = rank % tp, rank // tp
         tp_group, cp_group = tp_groups[c], cp_groups[t]
-        for cap in (None, 2.0):
+        for cap, bounds in ((None, None), (2.0, None), (None, (0.5, 5.0))):
             for sparse_mask in (False, True):
                 torch.manual_seed(718)
                 n, vocab = 13, 24
@@ -54,9 +54,20 @@ def _parallel_worker(rank, tp, cp, rendezvous):
                     max_seqlen=8,
                 )
                 oracle = logits.clone().requires_grad_()
-                lp, correction = _dense(oracle, tokens.roll(-1), ids, q, cap)
+                lp, correction = _dense(
+                    oracle, tokens.roll(-1), ids, q, cap, icepop_bounds=bounds
+                )
+
                 # Vary sampled weights independently of the head correction.
-                weight = 1.0 if cap is None else (lp.detach() + 4).exp().clamp_max(cap)
+                def sampled_weight(logp):
+                    ratio = (logp.detach() + 4).exp()
+                    if bounds is not None:
+                        return torch.where(
+                            (ratio >= bounds[0]) & (ratio <= bounds[1]), ratio, 0.0
+                        )
+                    return 1.0 if cap is None else ratio.clamp_max(cap)
+
+                weight = sampled_weight(lp)
                 expected = ((correction - weight * lp) * mask).sum() / mask.sum()
                 expected.backward()
                 config = SimpleNamespace(
@@ -70,6 +81,12 @@ def _parallel_worker(rank, tp, cp, rendezvous):
 
                     config.rejection_sampling = RejectionSamplingConfig(
                         action="clamp", upper=cap
+                    )
+                if bounds is not None:
+                    from areal.api.cli_args import RejectionSamplingConfig
+
+                    config.rejection_sampling = RejectionSamplingConfig(
+                        action="mask", lower=bounds[0], upper=bounds[1]
                     )
                 full = torch.cat([logits, torch.zeros(3, vocab, dtype=logits.dtype)])
                 local = full.chunk(cp)[c]
@@ -104,7 +121,7 @@ def _parallel_worker(rank, tp, cp, rendezvous):
                         atol=1e-10,
                         rtol=1e-10,
                     )
-                    w = 1.0 if cap is None else (lp.detach() + 4).exp().clamp_max(cap)
+                    w = sampled_weight(lp)
                     return (
                         (sc_correction - w * lp) * data["loss_mask"]
                     ).sum() / mask.sum()
