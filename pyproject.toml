@@ -137,6 +137,9 @@ dependencies = [
     "python-debian>=0.1.49",
 ]
 
+[project.entry-points."sglang.srt.plugins"]
+areal_sampling_mask = "areal.engine.sglang_sampling_mask_plugin:register"
+
 [project.optional-dependencies]
 # CUDA-dependent extras - these packages only have Linux x86_64 wheels
 # Platform markers ensure they're skipped on unsupported platforms

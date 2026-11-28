@@ -47,6 +47,7 @@ parts:
     chapters:
     - file: reference/checkpointing
     - file: reference/metrics_tracking
+    - file: reference/sampling_mask_transfer
     - file: reference/moe_visualization
     - file: reference/alloc_mode
     - file: reference/lora

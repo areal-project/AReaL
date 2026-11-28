@@ -112,10 +112,15 @@ async def test_running_timeout_http_is_terminal_without_retry():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("routed", [False, True])
 @pytest.mark.parametrize("wire", ["abort", "http"])
+@pytest.mark.parametrize("sampling_mask", [False, True])
 async def test_running_timeout_abort_never_resubmits_and_releases_route(
-    monkeypatch, routed, wire
+    monkeypatch, routed, wire, sampling_mask
 ):
     engine = _make_engine(return_routed_experts=False)
+    req = _make_request()
+    if sampling_mask:
+        engine.config._sampling_mask_sampling = req.gconfig.new(top_k=8)
+        req.metadata["_sampling_mask_lease"] = [1, 2, 3]
     result = {
         "meta_info": {
             "finish_reason": {
@@ -151,19 +156,19 @@ async def test_running_timeout_abort_never_resubmits_and_releases_route(
         if routed:
             engine.route_client = Route()
             with pytest.raises(ModelExecutionTimeoutError):
-                await engine._agenerate(_make_request())
+                await engine._agenerate(req)
             assert outcomes == ["aborted"]
             assert calls == 1
         else:
             if wire == "http":
                 engine.addresses = [addr]
                 with pytest.raises(ModelExecutionTimeoutError):
-                    await engine._agenerate(_make_request())
+                    await engine._agenerate(req)
                 return
             mocked = AsyncMock(return_value=result)
             monkeypatch.setattr(remote_inf_engine, "arequest_with_retry", mocked)
             with pytest.raises(ModelExecutionTimeoutError):
-                await engine._agenerate(_make_request())
+                await engine._agenerate(req)
             mocked.assert_awaited_once()
 
 

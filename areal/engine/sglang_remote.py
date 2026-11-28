@@ -188,6 +188,13 @@ class SGLangBackend:
             "skip_special_tokens": gconfig.skip_special_tokens,
             "frequency_penalty": gconfig.frequency_penalty,
         }
+        if gconfig._sampling_mask_transfer:
+            from areal.infra.sampling_mask.lifetime import LEASE_KEY, validate_lease
+
+            sample_params["custom_params"] = {
+                "areal_sampling_mask_version": version,
+                LEASE_KEY: validate_lease(req.metadata.get(LEASE_KEY)),
+            }
         if stop:
             sample_params["stop"] = stop
         if gconfig.seed is not None:
@@ -293,6 +300,7 @@ class SGLangBackend:
 
         head_ids, head_logprobs = parse_sampler_heads(meta_info, output_tokens)
         return HttpGenerationResult(
+            sampling_mask_refs=meta_info.get("sampling_mask_refs"),
             sampler_head_ids=head_ids,
             sampler_head_logprobs=head_logprobs,
             output_tokens=output_tokens,
@@ -650,9 +658,20 @@ class SGLangBackend:
                 fallback_base_gpu_id,
                 awex_transfer_rank_base,
             )
+        sampling_mask_top_k = server_args.pop("_sampling_mask_top_k", None)
+        sampling_mask_receivers = server_args.pop("_sampling_mask_receivers", 0)
+        # Accept historical configs; workflow leases now own mask lifetime.
+        server_args.pop("_sampling_mask_retained_versions", None)
+        if sampling_mask_top_k is not None:
+            server_args["skip_server_warmup"] = True
         cmd = SGLangConfig.build_cmd_from_args(server_args)
         _env = self.build_server_env(os.environ)
         _env.setdefault("PYTHONFAULTHANDLER", "1")
+        if sampling_mask_top_k is not None:
+            _env["NCCL_CUMEM_ENABLE"] = "1"
+            _env["AREAL_SAMPLING_MASK_TRANSFER"] = "1"
+            _env["AREAL_SAMPLING_MASK_TOP_K"] = str(sampling_mask_top_k)
+            _env["AREAL_SAMPLING_MASK_RECEIVERS"] = str(sampling_mask_receivers)
         if awex_transfer_rank_base is not None:
             _env["AWEX_TRANSFER_RANK_BASE"] = str(awex_transfer_rank_base)
 

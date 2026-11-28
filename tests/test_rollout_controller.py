@@ -1452,6 +1452,24 @@ class TestRolloutControllerRunner:
 class TestRolloutControllerExportStats:
     """Tests for export_stats method."""
 
+    def test_sampling_mask_http_counters_sum_without_prm_proxy_gate(self):
+        from types import SimpleNamespace
+
+        key = "sampling_mask/http/generate_response_body_bytes"
+        controller = SimpleNamespace(
+            config=SimpleNamespace(agent=None, _sampling_mask_sampling=object()),
+            _proxy_started=True,
+            proxy_workers=[object()],
+            _collective_rpc=Mock(return_value=[{key: 17}, {key: 23}]),
+            _proxy_collective_rpc=Mock(return_value=[{key: 101}]),
+            consumed_metrics=SimpleNamespace(export=lambda: {}),
+        )
+        assert RolloutController.export_stats(controller) == {key: 141}
+        controller._proxy_collective_rpc.assert_called_once_with(
+            method="export_stats",
+            http_timeout=60.0,
+        )
+
     def test_merge_worker_stats_preserves_reduction_semantics(self):
         """Worker distributions retain weighted average and extrema semantics."""
         all_raw_stats = [

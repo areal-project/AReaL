@@ -162,6 +162,7 @@ async def arequest_with_retry(
     verbose=False,
     generation_error: Callable[[int, str], Exception | None] | None = None,
     on_retry_error: Callable[[Exception], None] | None = None,
+    response_size_observer: Callable[[int], None] | None = None,
 ) -> dict | str | bytes:
     if timeout is None:
         timeout = DEFAULT_REQUEST_TIMEOUT
@@ -228,6 +229,10 @@ async def arequest_with_retry(
                         res = await response.text()
                     else:
                         res = await response.read()
+                    if response_size_observer is not None:
+                        # aiohttp caches the decoded body already consumed above.
+                        # Count bytes, not JSON characters; excludes HTTP framing.
+                        response_size_observer(len(await response.read()))
                     if verbose:
                         logger.info("get http result")
                     return res

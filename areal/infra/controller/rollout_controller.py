@@ -40,6 +40,7 @@ from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY, DatasetRoute
 from areal.infra.backend_router import BackendRouterService
 from areal.infra.rpc.rtensor import flatten_shard_ids
 from areal.infra.rpc.serialization import deserialize_value
+from areal.infra.sampling_mask.metrics import HTTP_COUNTER_KEYS
 from areal.infra.utils.concurrent import run_async_task
 from areal.infra.utils.exp_metadata import get_metadata_dir
 from areal.infra.utils.inference_targets import write_inference_targets
@@ -131,7 +132,7 @@ def _merge_worker_stats(
                 f"{key.removesuffix('_count')}/{reduction}" in raw_stats
                 for reduction in ("avg", "min", "max")
             )
-            if is_prm_sum or is_distribution_count:
+            if is_prm_sum or is_distribution_count or key in HTTP_COUNTER_KEYS:
                 sums[key] += value
 
     merged = dict(sums)
@@ -653,6 +654,9 @@ class RolloutController:
         if self._dispatcher is not None:
             cleanup_steps.append(("dispatcher destroy", self._dispatcher.destroy))
         cleanup_steps.append(("callback server stop", self._stop_callback_server))
+        owner = getattr(self, "_sampling_mask_owner", None)
+        if owner is not None:
+            cleanup_steps.append(("sampling-mask lease shutdown", owner.close))
         for name, cleanup in cleanup_steps:
             try:
                 cleanup()
@@ -1225,6 +1229,20 @@ class RolloutController:
             task_id = pending_task.task_id
 
             manager = self.staleness_manager
+            from areal.infra.sampling_mask.lifetime import (
+                LEASE_KEY,
+                LeaseRegistry,
+                arelease,
+            )
+
+            lease = None
+            transferred = False
+            data = pending_task.data
+            if getattr(self.config, "_sampling_mask_sampling", None) is not None:
+                if getattr(self, "_sampling_mask_owner", None) is None:
+                    self._sampling_mask_owner = LeaseRegistry()
+                lease = self._sampling_mask_owner.create()
+                data = {**data, LEASE_KEY: lease}
 
             try:
                 # Choose worker via round-robin.
@@ -1242,7 +1260,7 @@ class RolloutController:
                     worker.id,
                     "submit",
                     engine_name=engine_name,
-                    data=pending_task.data,
+                    data=data,
                     workflow=pending_task.workflow,
                     workflow_kwargs=pending_task.workflow_kwargs,
                     should_accept_fn=pending_task.should_accept_fn,
@@ -1287,6 +1305,7 @@ class RolloutController:
                         logger.info(
                             f"Finish and accept rollout. {self._rollout_stats()}"
                         )
+                    transferred = True
                     return _RolloutResult(
                         task_id=task_id, trajectory=traj, metrics=result["metrics"]
                     )
@@ -1312,6 +1331,12 @@ class RolloutController:
                 manager.on_rollout_rejected()
                 logger.error("Workflow execution failed: %s", exc, exc_info=True)
                 return None
+
+            finally:
+                with self._futures_lock:
+                    self._pending_futures.pop(task_id, None)
+                if lease is not None and not transferred:
+                    await arelease(lease)
 
         if pending_task.arena_stream_dataloader is None:
             return _submit_then_wait
@@ -1745,13 +1770,12 @@ class RolloutController:
     def export_stats(self) -> dict[str, float]:
         all_raw_stats = self._collective_rpc(method="export_stats", http_timeout=60.0)
         agent_config = self.config.agent
-        if (
-            self._proxy_started
-            and self.proxy_workers
-            and agent_config is not None
+        needs_proxy_stats = (
+            agent_config is not None
             and agent_config.prm.enabled
             and any(scorer.enabled for scorer in agent_config.prm.scorers)
-        ):
+        ) or getattr(self.config, "_sampling_mask_sampling", None) is not None
+        if self._proxy_started and self.proxy_workers and needs_proxy_stats:
             all_raw_stats += self._proxy_collective_rpc(
                 method="export_stats", http_timeout=60.0
             )

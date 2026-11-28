@@ -236,6 +236,21 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
+        if config.sampling_mask_transfer:
+            from areal.infra.sampling_mask.config import configure, preflight
+            from areal.utils.hf_utils import load_hf_config_snapshot
+
+            configure(config)
+            model_config = load_hf_config_snapshot(config.actor.path)
+            vocabulary = model_config.get("text_config", model_config).get("vocab_size")
+            if vocabulary is None:
+                raise ValueError(
+                    "sampling_mask_transfer preflight requires a local model config with vocab_size"
+                )
+            logger.warning(
+                "Sampling-mask startup memory estimate: %s",
+                preflight(config, vocabulary),
+            )
         self._r3_moe_config: R3MoEConfig | None = None
         self.mopd_execution_plan = MOPDExecutionPlan.from_config(config)
         self._apply_dte_config_envvars()
@@ -988,6 +1003,11 @@ class PPOTrainer:
                     dynamic_bs=config.dynamic_bs,
                     min_batch_size=min_consumer_batch_size,
                 )
+            from areal.infra.sampling_mask.lifetime import LEASES_KEY, release_batch
+
+            mask_leases = [
+                {LEASES_KEY: traj.pop(LEASES_KEY, [])} for traj in rollout_batch
+            ]
             if self._should_offload_rollout:
                 self._offload_rollout()
             elif self._is_v1_awex_colocate(self.config):
@@ -1311,6 +1331,7 @@ class PPOTrainer:
                             ("data", lambda: self.data_controller.clear_batches())
                         )
                     run_batch_cleanups(cleanups)
+                release_batch(mask_leases)
 
             # Evaluation shares the paused AWEX inference servers. Reduce GPU
             # stats before restoring their KV pool, but commit only after eval.
@@ -1448,7 +1469,12 @@ class PPOTrainer:
                 logger.warning(
                     "mopd_teacher_phase.close() failed during close", exc_info=True
                 )
-        for attr in ("eval_rollout", "rollout", "teacher", "ref", "critic", "actor"):
+        engines = ("eval_rollout", "rollout", "teacher", "ref", "critic", "actor")
+        if getattr(getattr(self, "config", None), "sampling_mask_transfer", False):
+            # GIN receivers must drain and deregister while their rollout peers
+            # still exist. Keep the established shutdown order when disabled.
+            engines = ("actor", "eval_rollout", "rollout", "teacher", "ref", "critic")
+        for attr in engines:
             engine = getattr(self, attr, None)
             if engine is not None:
                 try:
@@ -1530,7 +1556,9 @@ class PPOTrainer:
 
         # Disable some environ for NCCL weight update.
         for spec in self.config.actor.scheduling_spec:
-            spec.env_vars["NCCL_CUMEM_ENABLE"] = "0"
+            spec.env_vars["NCCL_CUMEM_ENABLE"] = (
+                "1" if self.config.sampling_mask_transfer else "0"
+            )
             spec.env_vars["NCCL_NVLS_ENABLE"] = "0"
 
     def _amend_deterministic_envvar(self):
@@ -1941,6 +1969,9 @@ class PPOTrainer:
                     cnt += 1
             if cnt:
                 results = self.eval_rollout.wait(cnt, timeout=None)
+                from areal.infra.sampling_mask.lifetime import release_batch
+
+                release_batch(results)
                 if is_single_controller():
                     # Evaluation has no training step to release the rollout RTensors.
                     self.actor.clear_batches(results)

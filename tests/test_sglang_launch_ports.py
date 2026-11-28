@@ -178,3 +178,33 @@ def test_colocated_launch_preserves_explicit_dense_transfer_base(
 
     assert launch.call_args.kwargs["env"]["AWEX_TRANSFER_RANK_BASE"] == "4"
     assert "_awex_transfer_rank_base" not in build_cmd.call_args.args[0]
+
+
+@pytest.mark.parametrize("top_k", [None, 30])
+@pytest.mark.parametrize("retained_versions", [2, 17])
+def test_launch_server_omits_legacy_mask_retention_from_final_command(
+    monkeypatch, top_k, retained_versions
+):
+    """Serialize real configs, including legacy values, through the final argv."""
+    config = sglang_remote.SGLangConfig(
+        model_path="test-model",
+        _sampling_mask_top_k=top_k,
+        _sampling_mask_receivers=1,
+        _sampling_mask_retained_versions=retained_versions,
+    )
+    args = sglang_remote.SGLangConfig.build_args(
+        config, tp_size=1, base_gpu_id=0, port=19000
+    )
+    args["nccl_port"] = 19001
+    child = MagicMock()
+    monkeypatch.setattr(sglang_remote.subprocess, "Popen", child)
+
+    sglang_remote.SGLangBackend().launch_server(args)
+
+    command = child.call_args.args[0]
+    assert "--model-path" in command
+    assert "test-model" in command
+    assert not any("sampling-mask-retained-versions" in arg for arg in command)
+    if top_k is not None:
+        assert "--skip-server-warmup" in command
+        assert child.call_args.kwargs["env"]["AREAL_SAMPLING_MASK_TOP_K"] == str(top_k)

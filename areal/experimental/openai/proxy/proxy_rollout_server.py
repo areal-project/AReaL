@@ -1222,6 +1222,12 @@ async def _call_client_create(
     if stream:
         kwargs["stream"] = True
 
+    from areal.infra.sampling_mask.lifetime import LEASE_KEY
+
+    mask_lease = (session_data.metadata or {}).get(LEASE_KEY)
+    if mask_lease is not None:
+        kwargs["metadata"] = {**(kwargs.get("metadata") or {}), LEASE_KEY: mask_lease}
+
     session_data.begin_model_request()
     try:
         client_kwargs: dict[str, Any] = {
