@@ -1042,7 +1042,55 @@ class TestRTensorAliasPreservation:
         first, second = result["multi_modal_input"]
         assert first["pixel_values"] is second["pixel_values"]
         assert first["image_grid_thw"] is second["image_grid_thw"]
+        for key, source in (
+            ("pixel_values", pixel_values),
+            ("image_grid_thw", image_grid_thw),
+        ):
+            stored = backend.tensors[first[key].shard.shard_id]
+            assert stored.data_ptr() == source.data_ptr()
         assert len(backend.store_calls) == 3
+
+    @pytest.mark.parametrize("preserve_tensor_aliases", [False, True])
+    def test_compaction_with_shared_images_across_trajectories(
+        self, monkeypatch, preserve_tensor_aliases
+    ):
+        """Separate compaction calls can share the original image when opted in."""
+        backend = _RecordingRTensorBackend()
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+        image = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        trajectories = [
+            {
+                "attention_mask": torch.tensor([[1, 1, 0]]),
+                "input_ids": torch.tensor([[i, i + 1, 0]]),
+                "multi_modal_input_history": [{"pixel_values": image}],
+            }
+            for i in range(2)
+        ]
+
+        result = RTensor.remotize(
+            trajectories,
+            node_addr="node-a",
+            preserve_tensor_aliases=preserve_tensor_aliases,
+        )
+
+        first, second = [
+            row["multi_modal_input_history"][0]["pixel_values"] for row in result
+        ]
+        assert (first is second) == preserve_tensor_aliases
+        assert len(backend.store_calls) == (5 if preserve_tensor_aliases else 6)
+        for original, row, reference in zip(
+            trajectories, result, (first, second), strict=True
+        ):
+            stored = backend.tensors[reference.shard.shard_id]
+            assert (stored.data_ptr() == image.data_ptr()) == preserve_tensor_aliases
+            torch.testing.assert_close(stored, image, rtol=0, atol=0)
+            torch.testing.assert_close(
+                backend.tensors[row["input_ids"].shard.shard_id],
+                original["input_ids"][:, :2],
+                rtol=0,
+                atol=0,
+            )
+            assert original["multi_modal_input_history"][0]["pixel_values"] is image
 
     def test_remotize_equal_distinct_tensors_uses_distinct_shards(self, monkeypatch):
         """Equal values should not merge when tensor identities differ."""
