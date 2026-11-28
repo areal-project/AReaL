@@ -273,6 +273,127 @@ def test_token_level_gae_applies_one_lambda_per_sample():
     )
 
 
+def _critic_free_gae_inputs(seed: int, *, dense: bool) -> dict:
+    """Rows of varied length with masked holes and one truncated row."""
+    generator = torch.Generator().manual_seed(seed)
+    bs, max_seqlen = 8, 257
+    seqlens = torch.randint(1, max_seqlen + 1, (bs,), generator=generator)
+    seqlens[0] = max_seqlen
+    positions = torch.arange(max_seqlen)
+    loss_mask = (positions < seqlens[:, None] - 1) & (
+        torch.rand(bs, max_seqlen, generator=generator) > 0.2
+    )
+    if dense:
+        rewards = 0.1 * torch.randn(bs, max_seqlen, generator=generator)
+    else:
+        rewards = torch.zeros(bs, max_seqlen)
+        rows = torch.arange(bs)
+        rewards[rows, (seqlens - 2).clamp(min=0)] = torch.randn(bs, generator=generator)
+    return dict(
+        rewards=rewards,
+        values=torch.zeros(bs, max_seqlen),
+        loss_mask=loss_mask.float(),
+        seq_no_eos_mask=seqlens == max_seqlen,
+        bootstrap_values=torch.zeros(bs),
+        discount=1.0,
+        gae_lambda=1.0,
+    )
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_token_level_gae_zero_values_matches_recurrence_for_outcome_rewards(seed):
+    """Critic-free gamma = lambda = 1 GAE keeps the recurrence results bitwise."""
+    inputs = _critic_free_gae_inputs(seed, dense=False)
+
+    expected = _compute_token_level_gae(**inputs)
+    advantages, returns = _compute_token_level_gae(**inputs, zero_values=True)
+
+    assert advantages.dtype == expected[0].dtype
+    assert torch.equal(advantages, expected[0])
+    assert torch.equal(returns, expected[1])
+
+
+def test_token_level_gae_zero_values_sums_dense_rewards_accurately():
+    """Dense KL rewards differ from the float32 recurrence only by its rounding."""
+    inputs = _critic_free_gae_inputs(0, dense=True)
+    rewards = inputs["rewards"].double()
+    loss_mask = inputs["loss_mask"].double()
+    exact = torch.nn.functional.pad(
+        (rewards[:, :-1] * loss_mask[:, :-1]).flip(-1).cumsum(-1).flip(-1), (0, 1)
+    )
+
+    recurrence, _ = _compute_token_level_gae(**inputs)
+    advantages, _ = _compute_token_level_gae(**inputs, zero_values=True)
+
+    torch.testing.assert_close(advantages, exact.float(), rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(advantages, recurrence, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"discount": 0.9},
+        {"gae_lambda": 0.95},
+        {"gae_lambda": torch.full((8,), 1.0)},
+    ],
+)
+def test_token_level_gae_zero_values_keeps_recurrence_otherwise(overrides):
+    """Only static gamma = lambda = 1 takes the reward-to-go path."""
+    inputs = {**_critic_free_gae_inputs(1, dense=True), **overrides}
+
+    expected = _compute_token_level_gae(**inputs)
+    advantages, returns = _compute_token_level_gae(**inputs, zero_values=True)
+
+    torch.testing.assert_close(advantages, expected[0], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(returns, expected[1], rtol=0.0, atol=0.0)
+
+
+def test_critic_free_advantages_match_explicit_zero_values(monkeypatch):
+    """A batch without critic values matches one carrying all-zero values."""
+    zero_values_flags = []
+
+    def record_zero_values(**kwargs):
+        zero_values_flags.append(kwargs["zero_values"])
+        return _compute_token_level_gae(**kwargs)
+
+    monkeypatch.setattr(
+        "areal.trainer.ppo.advantage_algorithms._compute_token_level_gae",
+        record_zero_values,
+    )
+    actor = _make_actor()
+    generator = torch.Generator().manual_seed(2)
+    bs, max_seqlen = 8, 129
+    seqlens = torch.randint(2, max_seqlen + 1, (bs,), generator=generator)
+    positions = torch.arange(max_seqlen)
+    attention_mask = positions < seqlens[:, None]
+    loss_mask = (
+        attention_mask
+        & (positions >= 16)
+        & (torch.rand(bs, max_seqlen, generator=generator) > 0.2)
+    ).float()
+    batch = {
+        "input_ids": attention_mask.long(),
+        "attention_mask": attention_mask,
+        "loss_mask": loss_mask,
+        "logprobs": -torch.rand(bs, max_seqlen, generator=generator) * loss_mask,
+        "rewards": torch.randn(bs, generator=generator),
+    }
+
+    critic_free = actor._compute_advantages(
+        {key: value.clone() for key, value in batch.items()}
+    )
+    zero_values = actor._compute_advantages(
+        {
+            **{key: value.clone() for key, value in batch.items()},
+            "values": torch.zeros(bs, max_seqlen),
+        }
+    )
+
+    assert zero_values_flags == [True, False]
+    for key in ("advantages", "returns", "tot_rewards"):
+        assert torch.equal(critic_free[key], zero_values[key])
+
+
 def test_static_gae_lambda_ignores_kwargs_and_legacy_missing_turn_ids():
     """A float lambda remains compatible with token workflows lacking turn IDs."""
     actor = _make_actor(
