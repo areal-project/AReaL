@@ -25,7 +25,7 @@ def math_reward_fn(completions: str, answer: str) -> float:
 
 
 class MathAgent:
-    def __init__(self, **kwargs):
+    def __init__(self, reward_max_workers: int | None = None, **kwargs):
         self.kwargs = kwargs.copy()
         max_new_tokens = self.kwargs.pop("max_new_tokens", None)
         self.kwargs.pop("max_turns", None)
@@ -33,7 +33,10 @@ class MathAgent:
             self.kwargs["max_tokens"] = max_new_tokens
         else:
             self.kwargs.pop("max_tokens", None)
-        self._reward_fn = AsyncRewardWrapper(math_reward_fn)
+        self._reward_fn = AsyncRewardWrapper(
+            math_reward_fn,
+            max_workers=reward_max_workers,
+        )
 
     async def run(self, data: dict, **extra_kwargs):
         http_client = extra_kwargs.get("http_client", None)
