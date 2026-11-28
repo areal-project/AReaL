@@ -87,6 +87,12 @@ from areal.engine.fsdp_utils import (
     fsdp2_load_full_state_dict,
     get_cosine_schedule_with_warmup,
 )
+from areal.engine.fsdp_utils.attn_impl import (
+    PACKED_MASK_ATTN_IMPLS,
+    PACKED_SEQ_BOUNDS_KWARG,
+    build_packed_attention_mask,
+    register_packed_sdpa,
+)
 from areal.engine.fsdp_utils.checkpoint import DCPState
 from areal.engine.fsdp_utils.grad import fsdp2_clip_grad_norm
 from areal.engine.fsdp_utils.optimizer import AnyPrecisionAdamW, PerLayerOptimWrapper
@@ -232,7 +238,7 @@ def _prepare_multimodal_forward_inputs(
 
 
 class FSDPEngine(TrainEngine):
-    # Packed-sequence metadata for the *text* tokens, added in ``_prepare_mb_list``.
+    # Text packing metadata that must not reach the vision tower.
     _TEXT_PACKING_KWARGS = (
         "cu_seqlens",
         "max_seqlen",
@@ -240,6 +246,7 @@ class FSDPEngine(TrainEngine):
         "cu_seq_lens_k",
         "max_length_q",
         "max_length_k",
+        PACKED_SEQ_BOUNDS_KWARG,
     )
 
     def __init__(self, config: TrainEngineConfig):
@@ -290,6 +297,14 @@ class FSDPEngine(TrainEngine):
         self._offload_depth: int = 0
         self._per_layer_optim_wrapper: PerLayerOptimWrapper | None = None
         self.enable_tree_training: bool = self.config.enable_tree_training
+        # sdpa/eager ignore cu_seq_lens, so packed sequences would attend to each
+        # other. flash_attention_* never takes this path.
+        self._use_packed_attn_mask: bool = (
+            self.config.attn_impl in PACKED_MASK_ATTN_IMPLS
+            and not self.enable_tree_training
+        )
+        if self._use_packed_attn_mask and self.config.attn_impl == "sdpa":
+            register_packed_sdpa()
 
     @classmethod
     def from_pretrained(
@@ -857,6 +872,19 @@ class FSDPEngine(TrainEngine):
                 inputs.update(tree_kwargs)
                 tree_attn_keys = list(tree_kwargs.keys())
 
+            packed_mask_applied = (
+                self._use_packed_attn_mask
+                and self.parallel_helper.sp_size == 1
+                and isinstance(inputs.get("attention_mask"), dict)
+            )
+            if packed_mask_applied:
+                if self.config.attn_impl == "sdpa":
+                    inputs[PACKED_SEQ_BOUNDS_KWARG] = tuple(
+                        inputs["cu_seqlens"].tolist()
+                    )
+                else:
+                    inputs["attention_mask"] = self._packed_attention_masks(inputs)
+
             with trace_scope("fsdp_engine.forward"):
                 outputs = self.model(**inputs)
             logits = outputs.logits.squeeze(0)
@@ -864,6 +892,11 @@ class FSDPEngine(TrainEngine):
             # Release tree attention metadata after forward pass
             for key in tree_attn_keys:
                 del inputs[key]
+            if packed_mask_applied:
+                inputs.pop(PACKED_SEQ_BOUNDS_KWARG, None)
+                inputs["attention_mask"] = dict(
+                    full_attention=None, sliding_attention=None
+                )
 
             if is_dummy:
                 # No output callback: dummy rows must not affect returned
@@ -1473,6 +1506,28 @@ class FSDPEngine(TrainEngine):
                 yield new_name, value
         else:
             yield from name_params_iterator
+
+    def _packed_attention_masks(
+        self, inputs: dict[str, Any]
+    ) -> dict[str, torch.Tensor]:
+        """Per-layer-type masks keeping packed sequences from attending to each other."""
+        seq_len = inputs["input_ids"].shape[-1]
+        mask_kwargs = dict(
+            device=self.device,
+            dtype=self._compute_dtype(),
+            attn_impl=self.config.attn_impl,
+        )
+        full = build_packed_attention_mask(inputs["cu_seqlens"], seq_len, **mask_kwargs)
+        sliding = full
+        hf_config = getattr(self.model_config, "text_config", self.model_config)
+        if "sliding_attention" in (getattr(hf_config, "layer_types", None) or []):
+            sliding = build_packed_attention_mask(
+                inputs["cu_seqlens"],
+                seq_len,
+                sliding_window=hf_config.sliding_window,
+                **mask_kwargs,
+            )
+        return dict(full_attention=full, sliding_attention=sliding)
 
     def _compute_dtype(self) -> torch.dtype:
         """Resolve config.dtype to torch.dtype (canonicalized in TrainEngineConfig)."""
