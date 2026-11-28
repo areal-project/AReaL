@@ -38,3 +38,15 @@ if importlib.util.find_spec("daytona") is not None:
         __all__.append("DaytonaPythonTool")
 else:
     globals().pop("DaytonaPythonTool", None)
+
+if importlib.util.find_spec("runta") is not None:
+    try:
+        RuntaPythonTool = importlib.import_module(
+            ".runta_python_tool", __name__
+        ).RuntaPythonTool
+    except ImportError:
+        globals().pop("RuntaPythonTool", None)
+    else:
+        __all__.append("RuntaPythonTool")
+else:
+    globals().pop("RuntaPythonTool", None)

@@ -25,6 +25,7 @@ class ToolType(Enum):
     PYTHON = "python"
     CALCULATOR = "calculator"
     DAYTONA_PYTHON = "daytona_python"
+    RUNTA_PYTHON = "runta_python"
 
 
 @dataclass
