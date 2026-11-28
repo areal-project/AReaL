@@ -505,6 +505,7 @@ megatron = [
 ]
 sandbox = [
     { name = "daytona" },
+    { name = "opensandbox" },
 ]
 sglang = [
     { name = "nvidia-cudnn-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -556,6 +557,7 @@ requires-dist = [
     { name = "cookiecutter", specifier = ">2.1.1" },
     { name = "datasets", specifier = ">=3.0.0" },
     { name = "daytona", marker = "extra == 'sandbox'", specifier = ">=0.167.0,<1" },
+    { name = "opensandbox", marker = "extra == 'sandbox'", specifier = ">=1.0" },
     { name = "distro-info", specifier = ">=1.0" },
     { name = "einops" },
     { name = "fastapi", specifier = ">=0.115.12" },
@@ -4632,6 +4634,24 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/44/5e/01fc105827347b02c7d93d58d918248198a5492ba7971b1ad9f874dbff62/openhands-0.0.0.tar.gz", hash = "sha256:8bbcf0c3459bfaf6982417a086735c4fe7c6347ff00fa8bf0eb4416bfe0d13ed", size = 114468, upload-time = "2025-09-09T14:34:38.663Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2f/1d/148d4be1a4a4081bea970b4f447a92eb20549c592fa6b5ebe2bcf9c7a324/openhands-0.0.0-py3-none-any.whl", hash = "sha256:c3feb6562f9aee35ed58c205567ac00277ba4bf9edad10de364aeeddeeb5f655", size = 141898, upload-time = "2025-09-09T14:34:37.349Z" },
+]
+
+[[package]]
+name = "opensandbox"
+version = "1.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "httpcore" },
+    { name = "httpx" },
+    { name = "httpx-sse" },
+    { name = "opentelemetry-api" },
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ad/44/55e37c760f28b008051dcc0afcdb09a0d526929f54ce952c5e4a1dbe7967/opensandbox-1.2.1.tar.gz", hash = "sha256:079bdde72fb7cd047de09c04928820cbed7394ab5c537ddda9e5ac108b1855df", size = 339085, upload-time = "2026-11-13T00:34:19.168Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/85/a8/f72a8549ff5d076841c9180bfcea251cc8c64adb9ceb3b6d4b919f84f989/opensandbox-1.2.1-py3-none-any.whl", hash = "sha256:67c9210a06cc2c18e621b34b6b21ce143e04226b6773ea17924783b379a75585", size = 742873, upload-time = "2026-11-13T00:34:17.886Z" },
 ]
 
 [[package]]
