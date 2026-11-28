@@ -61,6 +61,7 @@ def areal_launch_server(server_args) -> None:
         _setup_and_run_http_server,
         app,
     )
+    from sglang.srt.environ import envs
     from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 
     # ---- BEGIN AREAL ----
@@ -74,6 +75,13 @@ def areal_launch_server(server_args) -> None:
     )
     # ---- END AREAL ----
 
+    # AReaL's AWEX endpoints are registered on the Python HTTP app. The Rust
+    # server bypasses that app and cannot serve these endpoints.
+    if envs.SGLANG_RUST_SERVER.get():
+        raise RuntimeError(
+            "AReaL's SGLang AWEX endpoints require the Python HTTP server"
+        )
+
     # ---- BEGIN AREAL ----
     result_ipc = create_result_ipc()
     # ---- END AREAL ----
@@ -84,6 +92,7 @@ def areal_launch_server(server_args) -> None:
         port_args,
         scheduler_init_result,
         subprocess_watchdog,
+        weight_cache_daemon_procs,
     ) = Engine._launch_subprocesses(
         server_args=server_args,
         init_tokenizer_manager_func=init_tokenizer_manager,
@@ -93,17 +102,16 @@ def areal_launch_server(server_args) -> None:
         run_detokenizer_process_func=run_detokenizer_process,
     )
 
-    # ---- BEGIN AREAL ----
     if tokenizer_manager is None:
-        return
-    # ---- END AREAL ----
+        Engine._terminate_weight_cache_daemons(weight_cache_daemon_procs)
+        raise RuntimeError("SGLang did not create a Python tokenizer manager")
 
-    # ---- BEGIN AREAL ----
-    rpc_proxy = RpcProxy(port_args, result_ipc)
-    register_awex_endpoints(app, rpc_proxy)
-    # ---- END AREAL ----
-
+    rpc_proxy = None
     try:
+        # ---- BEGIN AREAL ----
+        rpc_proxy = RpcProxy(port_args, result_ipc)
+        register_awex_endpoints(app, rpc_proxy)
+        # ---- END AREAL ----
         _setup_and_run_http_server(
             server_args,
             tokenizer_manager,
@@ -115,7 +123,9 @@ def areal_launch_server(server_args) -> None:
         )
     finally:
         # ---- BEGIN AREAL ----
-        rpc_proxy.close()
+        if rpc_proxy is not None:
+            rpc_proxy.close()
+        Engine._terminate_weight_cache_daemons(weight_cache_daemon_procs)
         # ---- END AREAL ----
 
 

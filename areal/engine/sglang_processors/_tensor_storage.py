@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Avoid serializing a whole image batch for each split CPU tensor view."""
 
-from dataclasses import replace
+from copy import copy
 from typing import Any
 
 import torch
@@ -40,14 +40,16 @@ def compact_mm_item_storage(items: list[Any]) -> list[Any]:
     already compact tensors, and native CUDA/IPC objects.
     """
     memo: dict[int, Any] = {}
-    return [
-        replace(
-            item,
-            feature=_compact_cpu_storage(item.feature, memo),
-            precomputed_embeddings=_compact_cpu_storage(
-                item.precomputed_embeddings, memo
-            ),
-            model_specific_data=_compact_cpu_storage(item.model_specific_data, memo),
+    compacted = []
+    for item in items:
+        # SGLang 0.5.20 uses msgspec.Struct; older releases use dataclasses.
+        compact = copy(item)
+        compact.feature = _compact_cpu_storage(item.feature, memo)
+        compact.precomputed_embeddings = _compact_cpu_storage(
+            item.precomputed_embeddings, memo
         )
-        for item in items
-    ]
+        compact.model_specific_data = _compact_cpu_storage(
+            item.model_specific_data, memo
+        )
+        compacted.append(compact)
+    return compacted

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
+from areal.utils import pkg_version
 from areal.v2.inference_service.sglang import routed_experts_compat as compat
 
 
@@ -50,8 +52,117 @@ def test_normalize_routed_experts_server_args_keeps_non_r3_path_unchanged():
     assert server_args.disable_piecewise_cuda_graph is False
 
 
+def test_normalize_routed_experts_server_args_keeps_v0520_graph_config():
+    server_args = SimpleNamespace(
+        enable_return_routed_experts=True,
+        cuda_graph_backend_prefill="breakable",
+    )
+
+    assert compat.normalize_routed_experts_server_args(server_args) is False
+    assert server_args.cuda_graph_backend_prefill == "breakable"
+    assert not hasattr(server_args, "disable_piecewise_cuda_graph")
+
+
+def test_v0520_capturer_sizes_device_and_gather_buffers_before_capture(monkeypatch):
+    class FakeCapturer:
+        def __init__(
+            self,
+            model_config,
+            num_tokens,
+            max_running_requests,
+            num_fused_shared_experts,
+            device,
+        ):
+            del model_config, num_tokens, num_fused_shared_experts, device
+            self.device_rows = max(64, max_running_requests) * 2
+            self.gather_rows = self.device_rows * 4
+
+    packages = (
+        "sglang",
+        "sglang.srt",
+        "sglang.srt.state_capturer",
+    )
+    for name in packages:
+        module = ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+    runtime = ModuleType("sglang.srt.runtime_context")
+    runtime.get_schedule = lambda: SimpleNamespace(
+        chunked_prefill_size=-1,
+        max_prefill_tokens=512,
+    )
+    runtime.max_prefill_buffer_tokens = lambda: 0
+    monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
+    capturer = ModuleType("sglang.srt.state_capturer.routed_experts")
+    capturer.RoutedExpertsCapturer = FakeCapturer
+    monkeypatch.setitem(sys.modules, capturer.__name__, capturer)
+    monkeypatch.setattr(pkg_version, "get_version", lambda _: "0.5.20")
+
+    assert compat.apply_sglang_routed_experts_token_cache_patch() is True
+    assert compat.apply_sglang_routed_experts_token_cache_patch() is False
+    instance = FakeCapturer(None, 1024, 16, 0, "cuda")
+    assert instance.device_rows == 1024
+    assert instance.gather_rows == 4096
+
+
+def test_v0520_capturer_sizes_for_unchunked_prompt_above_max_prefill_tokens(
+    monkeypatch,
+):
+    """Size unchunked prefill buffer for context_len so single long prompts fit."""
+
+    class FakeCapturer:
+        def __init__(
+            self,
+            model_config,
+            num_tokens,
+            max_running_requests,
+            num_fused_shared_experts,
+            device,
+        ):
+            del model_config, num_tokens, num_fused_shared_experts
+            self.buffer = torch.zeros((max_running_requests, 2, 4), dtype=torch.int32)
+            self.device = device
+
+        def capture(self, layer_id: int, topk_indices: torch.Tensor) -> None:
+            batch = topk_indices.shape[0]
+            self.buffer[:batch, layer_id, :] = topk_indices
+
+    for name in ("sglang", "sglang.srt", "sglang.srt.state_capturer"):
+        module = ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+    runtime = ModuleType("sglang.srt.runtime_context")
+    runtime.get_schedule = lambda: SimpleNamespace(
+        chunked_prefill_size=-1,
+        max_prefill_tokens=2048,
+    )
+    runtime.max_prefill_buffer_tokens = lambda: 0
+    monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
+    capturer = ModuleType("sglang.srt.state_capturer.routed_experts")
+    capturer.RoutedExpertsCapturer = FakeCapturer
+    monkeypatch.setitem(sys.modules, capturer.__name__, capturer)
+    monkeypatch.setattr(pkg_version, "get_version", lambda _: "0.5.20")
+
+    assert compat.apply_sglang_routed_experts_token_cache_patch() is True
+
+    # DP=1, context_length=8192, max_prefill_tokens=2048, max_running_requests=32.
+    instance = FakeCapturer(SimpleNamespace(context_len=8192), 16384, 32, 0, "cpu")
+    assert instance.buffer.shape[0] == 8192
+
+    # A 4,096-token uncached prompt must fit without raising a shape mismatch.
+    topk_indices = torch.arange(4096 * 4, dtype=torch.int32).reshape(4096, 4)
+    instance.capture(layer_id=1, topk_indices=topk_indices)
+    torch.testing.assert_close(instance.buffer[:4096, 1], topk_indices)
+
+    # Cap by token pool size when model context_len exceeds KV cache capacity.
+    capped = FakeCapturer(SimpleNamespace(context_len=131072), 4096, 32, 0, "cpu")
+    assert capped.buffer.shape[0] == 4096
+
+
 def test_token_cache_patch_handles_token_level_prefill_rows(monkeypatch):
     pytest.importorskip("sglang")
+    if pkg_version.get_version("sglang").split("+", 1)[0] == "0.5.20":
+        pytest.skip("The legacy routed-experts cache was replaced in SGLang 0.5.20")
 
     from sglang.srt import server_args as sglang_server_args
     from sglang.srt.layers.moe import routed_experts_capturer

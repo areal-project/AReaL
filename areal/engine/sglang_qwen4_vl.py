@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Align Qwen4 image preprocessing in the supported SGLang installation."""
+"""Align Qwen4 image preprocessing in supported SGLang installations."""
 
+import hashlib
 from pathlib import Path
 
 from areal.engine._sglang_source_patch import patch_installed_module, patch_source
@@ -10,6 +11,12 @@ LEGACY_PATCHED_SHA256 = (
     "7c5c20550fed1a385daa07ce4c9b5a0b74151cea22d7762299fae47a8169e189"
 )
 PATCHED_SHA256 = "3a9d693446185f30d3fd21efc4c68ef6b27c7da757ccf0b0e29d6c32ee1e2e52"
+V0520_EXPECTED_SHA256 = (
+    "a6ed09b25c262a2c08827d5b9443f87de09c480d0239f45115a9a3254f6a0c79"
+)
+V0520_PATCHED_SHA256 = (
+    "f1113514d9f364048600a69d543e8cae8a86b500ff8019eff93541751d0ba24d"
+)
 TARGET_RELATIVE = Path("srt/multimodal/processors/qwen_vl.py")
 OLD = '        if self.model_type in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"):\n'
 NEW = (
@@ -40,6 +47,18 @@ def patched_source(source: bytes) -> bytes:
     A separate PIL resize or the CUDA resize kernel can preserve token counts
     while changing the pixel tensor.
     """
+    if hashlib.sha256(source).hexdigest() in (
+        V0520_EXPECTED_SHA256,
+        V0520_PATCHED_SHA256,
+    ):
+        # 0.5.20 includes Qwen4 in the native processor and delegates image
+        # resizing to HF. Keep only the CPU fast-processor alignment.
+        return patch_source(
+            source,
+            target_relative=TARGET_RELATIVE,
+            replacements_by_sha256={V0520_EXPECTED_SHA256: [(DEVICE_OLD, DEVICE_NEW)]},
+            patched_sha256=V0520_PATCHED_SHA256,
+        )
     preprocessing = [(RESIZE_OLD, RESIZE_NEW), (DEVICE_OLD, DEVICE_NEW)]
     return patch_source(
         source,

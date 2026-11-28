@@ -91,8 +91,8 @@ class PPSchedulerBridge:
         logger.info(
             "PPSchedulerBridge bound (pp_size=%d, pp_rank=%d, tp_rank=%d).",
             self._pp_size,
-            getattr(model_runner, "pp_rank", -1),
-            getattr(model_runner, "tp_rank", -1),
+            model_runner.ps.pp_rank,
+            model_runner.ps.tp_rank,
         )
 
     def _bind_tp_worker(self, tp_worker: Any, model_runner: Any) -> None:
@@ -105,27 +105,27 @@ class PPSchedulerBridge:
 
             if (
                 pp_rank_from_name is not None
-                and model_runner.pp_rank != pp_rank_from_name
+                and model_runner.ps.pp_rank != pp_rank_from_name
             ):
                 # This worker is at a different PP rank -- skip group creation
                 # and store a None sentinel so update/destroy can short-circuit.
-                model_runner._model_update_group[group_name] = None
+                model_runner.weight_updater._model_update_group[group_name] = None
                 logger.info(
                     "Skipping group '%s': target pp_rank=%d but worker is pp_rank=%d.",
                     group_name,
                     pp_rank_from_name,
-                    model_runner.pp_rank,
+                    model_runner.ps.pp_rank,
                 )
                 return True, (
                     f"Skipped group creation (pp_rank mismatch: "
-                    f"target={pp_rank_from_name}, local={model_runner.pp_rank})."
+                    f"target={pp_rank_from_name}, local={model_runner.ps.pp_rank})."
                 )
 
             if pp_rank_from_name is not None:
                 logger.info(
                     "Worker pp_rank=%d tp_rank=%d joining per-PP-rank group '%s'.",
-                    model_runner.pp_rank,
-                    model_runner.tp_rank,
+                    model_runner.ps.pp_rank,
+                    model_runner.ps.tp_rank,
                     group_name,
                 )
 
@@ -141,8 +141,8 @@ class PPSchedulerBridge:
                     logger.warning(
                         "init_weights_update_group BLOCKED %.0fs: pp=%s tp=%s group=%s",
                         elapsed,
-                        getattr(model_runner, "pp_rank", "?"),
-                        getattr(model_runner, "tp_rank", "?"),
+                        model_runner.ps.pp_rank,
+                        model_runner.ps.tp_rank,
                         group_name,
                     )
 
@@ -158,8 +158,8 @@ class PPSchedulerBridge:
                     "init_weights_update_group EXCEPTION after %.2fs: "
                     "pp=%s tp=%s group=%s: %s",
                     _time.monotonic() - _t0,
-                    model_runner.pp_rank,
-                    model_runner.tp_rank,
+                    model_runner.ps.pp_rank,
+                    model_runner.ps.tp_rank,
                     group_name,
                     e,
                     exc_info=True,
@@ -171,8 +171,8 @@ class PPSchedulerBridge:
             logger.info(
                 "init_weights_update_group completed in %.2fs: pp=%s tp=%s group=%s",
                 _elapsed,
-                model_runner.pp_rank,
-                model_runner.tp_rank,
+                model_runner.ps.pp_rank,
+                model_runner.ps.tp_rank,
                 group_name,
             )
             return result
@@ -180,10 +180,12 @@ class PPSchedulerBridge:
         tp_worker.init_weights_update_group = _pp_init_weights_update_group
 
     def _bind_model_runner(self, model_runner: Any) -> None:
-        """Wrap ModelRunner's update and destroy methods for per-PP-rank routing."""
+        """Wrap the ModelRunner's weight updater for per-PP-rank routing."""
+
+        updater = model_runner.weight_updater
 
         # ---- update_weights_from_distributed ----
-        _orig_update = model_runner.update_weights_from_distributed
+        _orig_update = updater.update_weights_from_distributed
 
         def _pp_update_weights_from_distributed(
             names,
@@ -193,42 +195,40 @@ class PPSchedulerBridge:
             load_format=None,
         ):
             """Skip broadcast receive if this worker did not join *group_name*."""
-            pg = model_runner._model_update_group.get(group_name)
-            if pg is None and group_name in model_runner._model_update_group:
+            pg = updater._model_update_group.get(group_name)
+            if pg is None and group_name in updater._model_update_group:
                 # Sentinel: this worker was deliberately excluded from the group.
                 logger.debug(
                     "Skipping update_weights_from_distributed for group '%s': "
                     "worker pp_rank=%d did not join.",
                     group_name,
-                    model_runner.pp_rank,
+                    model_runner.ps.pp_rank,
                 )
                 return True, (
-                    f"Skipped weight update (worker pp_rank={model_runner.pp_rank} "
+                    f"Skipped weight update (worker pp_rank={model_runner.ps.pp_rank} "
                     f"did not join group '{group_name}')."
                 )
             return _orig_update(names, dtypes, shapes, group_name, load_format)
 
-        model_runner.update_weights_from_distributed = (
-            _pp_update_weights_from_distributed
-        )
+        updater.update_weights_from_distributed = _pp_update_weights_from_distributed
 
         # ---- destroy_weights_update_group ----
-        _orig_destroy = model_runner.destroy_weights_update_group
+        _orig_destroy = updater.destroy_weights_update_group
 
         def _pp_destroy_weights_update_group(group_name):
             """Skip destruction if this worker holds a None sentinel."""
-            pg = model_runner._model_update_group.get(group_name)
-            if pg is None and group_name in model_runner._model_update_group:
-                model_runner._model_update_group.pop(group_name, None)
+            pg = updater._model_update_group.get(group_name)
+            if pg is None and group_name in updater._model_update_group:
+                updater._model_update_group.pop(group_name, None)
                 logger.debug(
                     "Skipping destroy for group '%s': worker pp_rank=%d did not join.",
                     group_name,
-                    model_runner.pp_rank,
+                    model_runner.ps.pp_rank,
                 )
                 return True, (
-                    f"Skipped group destruction (worker pp_rank={model_runner.pp_rank} "
+                    f"Skipped group destruction (worker pp_rank={model_runner.ps.pp_rank} "
                     f"did not join group '{group_name}')."
                 )
             return _orig_destroy(group_name)
 
-        model_runner.destroy_weights_update_group = _pp_destroy_weights_update_group
+        updater.destroy_weights_update_group = _pp_destroy_weights_update_group

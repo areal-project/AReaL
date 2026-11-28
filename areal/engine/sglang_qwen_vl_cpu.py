@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Use CPU/PIL Qwen decoding and preserve native SGLang HF device policy."""
 
+import hashlib
 from pathlib import Path
 
 from areal.engine._sglang_source_patch import patch_source
@@ -10,9 +11,16 @@ TARGET_RELATIVE = Path("srt/multimodal/processors/qwen_vl.py")
 BASE_RELATIVE = Path("srt/multimodal/processors/base_processor.py")
 EXPECTED_SHA256 = "285fd0e0eef80d8c54db71724ef7cc369ae9379023437d3e2015deb65df69e17"
 PATCHED_SHA256 = "aa7980ea2dd72d699069e673a22a5c892e230b891de9047378e1a7fc1a1fe114"
+V0520_EXPECTED_SHA256 = (
+    "a6ed09b25c262a2c08827d5b9443f87de09c480d0239f45115a9a3254f6a0c79"
+)
+V0520_PATCHED_SHA256 = (
+    "7c17e708749a41da3e7ae12790bdcf271e9f23fba8a03ae7e919ee8a1a7ec06a"
+)
 BASE_EXPECTED_SHA256 = (
     "2396ed6de130e17048eac64e97a2c665b7a33e8cdb42427b7ba5dd1e8be1ef61"
 )
+V0520_BASE_SHA256 = "f62540dbe19cd5ea8009de8a6326375688ef851942ba664385ad68f3b2a3b9aa"
 LEGACY_CPU_SHA256 = "21fcee80ac708d3d8fabda2f476cb420b3b05504b1b13d5860654674b192e27b"
 DECODE_OLD = "    supports_transformers_backend = True\n"
 DECODE_NEW = DECODE_OLD + "    gpu_image_decode = False\n"
@@ -30,6 +38,16 @@ LEGACY_CPU_DEVICE = (
 
 def patched_source(source: bytes) -> bytes:
     """Decode JPEGs as PIL images; retain native pixel bounds and resize."""
+    if hashlib.sha256(source).hexdigest() in (
+        V0520_EXPECTED_SHA256,
+        V0520_PATCHED_SHA256,
+    ):
+        return patch_source(
+            source,
+            target_relative=TARGET_RELATIVE,
+            replacements_by_sha256={V0520_EXPECTED_SHA256: [(DECODE_OLD, DECODE_NEW)]},
+            patched_sha256=V0520_PATCHED_SHA256,
+        )
     return patch_source(
         source,
         target_relative=TARGET_RELATIVE,
@@ -40,6 +58,8 @@ def patched_source(source: bytes) -> bytes:
 
 def patched_base_source(source: bytes) -> bytes:
     """Restore native HF dispatch if the earlier CPU override was installed."""
+    if hashlib.sha256(source).hexdigest() == V0520_BASE_SHA256:
+        return source
     return patch_source(
         source,
         target_relative=BASE_RELATIVE,

@@ -16,6 +16,11 @@ class _RecordingRunner:
     def __init__(self):
         self.calls = []
         self.result = (True, "Success")
+        self.weight_updater = SimpleNamespace(
+            update_weights_from_tensor=self.update_weights_from_tensor,
+            update_weights_from_distributed=object(),
+            _model_update_group={},
+        )
 
     def update_weights_from_tensor(self, named_tensors, load_format=None):
         self.calls.append((list(named_tensors), load_format))
@@ -42,21 +47,23 @@ def test_bridge_non_nextn_keeps_original_update(monkeypatch):
     """Non-NEXTN inference must retain SGLang's original update path."""
     scheduler, target_runner, _ = _make_scheduler()
     original_update = object()
-    target_runner.update_weights_from_distributed = original_update
+    target_runner.weight_updater.update_weights_from_distributed = original_update
     monkeypatch.setattr(bridge_mod, "_sglang_version", lambda: "unexpected")
 
     MTPDistributedWeightUpdateBridge(
         scheduler, SimpleNamespace(speculative_algorithm=None)
     ).bind()
 
-    assert target_runner.update_weights_from_distributed is original_update
+    assert (
+        target_runner.weight_updater.update_weights_from_distributed is original_update
+    )
 
 
 def test_bridge_nextn_does_not_require_model_type(monkeypatch):
     """NEXTN routing must be enabled without inspecting model metadata."""
     scheduler, target_runner, _ = _make_scheduler()
     original_update = object()
-    target_runner.update_weights_from_distributed = original_update
+    target_runner.weight_updater.update_weights_from_distributed = original_update
     monkeypatch.setattr(
         bridge_mod, "_sglang_version", lambda: bridge_mod._SUPPORTED_SGLANG_VERSION
     )
@@ -65,8 +72,11 @@ def test_bridge_nextn_does_not_require_model_type(monkeypatch):
         scheduler, SimpleNamespace(speculative_algorithm="NEXTN")
     ).bind()
 
-    assert callable(target_runner.update_weights_from_distributed)
-    assert target_runner.update_weights_from_distributed is not original_update
+    assert callable(target_runner.weight_updater.update_weights_from_distributed)
+    assert (
+        target_runner.weight_updater.update_weights_from_distributed
+        is not original_update
+    )
 
 
 @pytest.mark.parametrize("spec_v2", [False, True])
@@ -76,7 +86,7 @@ def test_bridge_runtime_eagle_binds_builtin_mtp_for_both_spec_versions(
     """Normalized NEXTN must find the draft runner in spec v1 and v2."""
     scheduler, target_runner, _ = _make_scheduler(spec_v2=spec_v2)
     original_update = object()
-    target_runner.update_weights_from_distributed = original_update
+    target_runner.weight_updater.update_weights_from_distributed = original_update
     monkeypatch.setattr(
         bridge_mod, "_sglang_version", lambda: bridge_mod._SUPPORTED_SGLANG_VERSION
     )
@@ -89,15 +99,18 @@ def test_bridge_runtime_eagle_binds_builtin_mtp_for_both_spec_versions(
         ),
     ).bind()
 
-    assert callable(target_runner.update_weights_from_distributed)
-    assert target_runner.update_weights_from_distributed is not original_update
+    assert callable(target_runner.weight_updater.update_weights_from_distributed)
+    assert (
+        target_runner.weight_updater.update_weights_from_distributed
+        is not original_update
+    )
 
 
 def test_bridge_external_eagle_keeps_original_update(monkeypatch):
     """An external EAGLE draft model must not use the built-in MTP bridge."""
     scheduler, target_runner, _ = _make_scheduler()
     original_update = object()
-    target_runner.update_weights_from_distributed = original_update
+    target_runner.weight_updater.update_weights_from_distributed = original_update
     monkeypatch.setattr(bridge_mod, "_sglang_version", lambda: "unexpected")
 
     MTPDistributedWeightUpdateBridge(
@@ -108,7 +121,9 @@ def test_bridge_external_eagle_keeps_original_update(monkeypatch):
         ),
     ).bind()
 
-    assert target_runner.update_weights_from_distributed is original_update
+    assert (
+        target_runner.weight_updater.update_weights_from_distributed is original_update
+    )
 
 
 def test_bridge_rejects_unvalidated_sglang_version(monkeypatch):
@@ -116,7 +131,7 @@ def test_bridge_rejects_unvalidated_sglang_version(monkeypatch):
     scheduler, _, _ = _make_scheduler()
     monkeypatch.setattr(bridge_mod, "_sglang_version", lambda: "0.5.11")
 
-    with pytest.raises(RuntimeError, match="supports only sglang==0.5.10.post1"):
+    with pytest.raises(RuntimeError, match="supports only sglang==0.5.20"):
         MTPDistributedWeightUpdateBridge(
             scheduler, SimpleNamespace(speculative_algorithm="NEXTN")
         ).bind()
@@ -158,7 +173,7 @@ def test_bridge_nextn_receives_once_and_updates_draft_then_target(monkeypatch):
     MTPDistributedWeightUpdateBridge(
         scheduler, SimpleNamespace(speculative_algorithm="NEXTN")
     ).bind()
-    success, message = target_runner.update_weights_from_distributed(
+    success, message = target_runner.weight_updater.update_weights_from_distributed(
         [name for name, _ in received],
         ["bfloat16"] * len(received),
         [(1,)] * len(received),
@@ -176,7 +191,9 @@ def test_bridge_nextn_receives_once_and_updates_draft_then_target(monkeypatch):
 
 def test_receive_rejects_unvalidated_load_format():
     """Unknown transport load formats must not silently use default loading."""
-    runner = SimpleNamespace(_model_update_group={"group": object()})
+    runner = SimpleNamespace(
+        weight_updater=SimpleNamespace(_model_update_group={"group": object()})
+    )
 
     with pytest.raises(NotImplementedError, match="flattened_bucket"):
         bridge_mod._receive_named_tensors(
@@ -222,7 +239,7 @@ def test_bridge_draft_load_failure_skips_target(monkeypatch):
     MTPDistributedWeightUpdateBridge(
         scheduler, SimpleNamespace(speculative_algorithm="NEXTN")
     ).bind()
-    success, message = target_runner.update_weights_from_distributed(
+    success, message = target_runner.weight_updater.update_weights_from_distributed(
         ["mtp.fc.weight"],
         ["bfloat16"],
         [(1,)],
