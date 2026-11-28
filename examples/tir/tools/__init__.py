@@ -38,3 +38,15 @@ if importlib.util.find_spec("daytona") is not None:
         __all__.append("DaytonaPythonTool")
 else:
     globals().pop("DaytonaPythonTool", None)
+
+if importlib.util.find_spec("boxd") is not None:
+    try:
+        BoxdPythonTool = importlib.import_module(
+            ".boxd_python_tool", __name__
+        ).BoxdPythonTool
+    except ImportError:
+        globals().pop("BoxdPythonTool", None)
+    else:
+        __all__.append("BoxdPythonTool")
+else:
+    globals().pop("BoxdPythonTool", None)
