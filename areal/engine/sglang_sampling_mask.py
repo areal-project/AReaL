@@ -7,6 +7,7 @@ computes old logprob from exactly the logits and support used to sample.
 """
 
 import os
+from functools import cache
 
 import torch
 
@@ -161,7 +162,18 @@ def register_backend() -> None:
         # SGLang otherwise ignores request seeds outside deterministic mode.
         # Preserve explicit seeds, including mixed seeded/unseeded batches.
         seeds = [request.sampling_params.sampling_seed for request in batch.reqs]
-        if result.sampling_seed is None and any(seed is not None for seed in seeds):
+        has_request_seed = any(seed is not None for seed in seeds)
+        if has_request_seed:
+            from areal.engine.sglang_sampling_mask_plugin import (
+                JOINT_DSPARK,
+                runtime_settings,
+            )
+
+            if runtime_settings()[3] == JOINT_DSPARK:
+                raise ValueError(
+                    "DSpark joint verification does not support request seeds"
+                )
+        if result.sampling_seed is None and has_request_seed:
             random_seeds = torch.randint(0, 2**31, (len(seeds),)).tolist()
             result.sampling_seed = torch.tensor(
                 [
@@ -184,6 +196,7 @@ def register_backend() -> None:
                 or params.presence_penalty != 0
                 or params.repetition_penalty != 1
                 or params.logit_bias
+                or params.min_new_tokens != 0
                 or params.min_p != 0
             ):
                 raise ValueError(
@@ -221,29 +234,74 @@ def register_backend() -> None:
     SamplingBatchInfo.merge_batch = merge_batch
     SamplingBatchInfo._areal_mask_installed = True
 
+    # DSpark constructs both target and draft runners in the same worker.
+    @cache
+    def get_producer(device: int, max_sessions: int):
+        from areal.infra.sampling_mask.service import MaskProducer
+
+        return MaskProducer(device, max_sessions=max_sessions)
+
     class SamplingMaskSampler(Sampler):
         def __init__(self):
             super().__init__()
-            from areal.engine.sglang_sampling_mask_plugin import runtime_settings
-            from areal.infra.sampling_mask.service import MaskProducer
+            from areal.engine.sglang_sampling_mask_plugin import (
+                JOINT_DSPARK,
+                runtime_settings,
+            )
 
             backend, pp_size, attn_cp_size, speculative_algorithm = runtime_settings()
             if backend != "areal_sampling_mask":
                 raise ValueError(
                     "sampling_mask_transfer sampler backend was overridden"
                 )
-            if speculative_algorithm or pp_size != 1 or attn_cp_size != 1:
+            self.dspark = speculative_algorithm == JOINT_DSPARK
+            if (
+                (speculative_algorithm and not self.dspark)
+                or pp_size != 1
+                or attn_cp_size != 1
+            ):
                 raise ValueError(
-                    "sampling_mask_transfer requires non-speculative SGLang PP=1"
+                    "sampling_mask_transfer requires SGLang PP=1, attention CP=1 and a supported verify policy"
                 )
             self.explicit_top_k = int(os.environ["AREAL_SAMPLING_MASK_TOP_K"])
             self.producer = (
-                MaskProducer(
+                get_producer(
                     torch.cuda.current_device(),
                     max_sessions=int(os.environ["AREAL_SAMPLING_MASK_RECEIVERS"]),
                 )
                 if torch.distributed.get_rank(self.tp_sync_group) == 0
                 else None
+            )
+
+        def prepare_verify_policy(self, logits, batch, stride):
+            from areal.engine.sglang_dspark_policy import prepare_verify_policy
+
+            info = batch.sampling_info
+            if info.has_custom_logit_processor or info.grammars or info.is_any_greedy:
+                raise ValueError(
+                    "DSpark joint verification requires stochastic requests without grammar or custom processors"
+                )
+            if any(batch.top_logprobs_nums or ()) or any(
+                batch.token_ids_logprobs or ()
+            ):
+                raise ValueError(
+                    "DSpark joint verification only supports selected-token logprob requests"
+                )
+            return prepare_verify_policy(
+                logits,
+                info,
+                stride,
+                self._bound(logits),
+                self.producer,
+                info._areal_mask_versions,
+                info._areal_mask_leases,
+            )
+
+        def _bound(self, logits):
+            return (
+                min(self.explicit_top_k, logits.shape[-1])
+                if self.explicit_top_k > 0
+                else logits.shape[-1]
             )
 
         def forward(
@@ -264,20 +322,15 @@ def register_backend() -> None:
                     "sampling_mask_transfer does not support auxiliary top/token logprob requests"
                 )
             logits = logits_output.next_token_logits
-            bound = (
-                min(self.explicit_top_k, logits.shape[-1])
-                if self.explicit_top_k > 0
-                else logits.shape[-1]
-            )
             ids, logp, counts = candidate_distribution(
                 logits,
                 sampling_info.temperatures,
                 sampling_info.top_ps,
                 sampling_info.top_ks,
-                candidate_bound=bound,
+                candidate_bound=self._bound(logits),
             )
             column = sample_candidate_columns(
-                logp, sampling_info.sampling_seed, positions
+                logp, None if self.dspark else sampling_info.sampling_seed, positions
             )
             tokens = ids.gather(1, column).reshape(-1)
             self._sync_token_ids_across_tp(tokens, sampling_info)
@@ -290,6 +343,19 @@ def register_backend() -> None:
             )
             column = matches.to(torch.int32).argmax(-1, keepdim=True)
             logits_output.next_token_logprobs = logp.gather(1, column).reshape(-1)
+            if self.dspark:
+                from areal.engine.sglang_dspark_policy import CommittedMaskRows
+
+                if self.producer is not None:
+                    logits_output.auxiliary_device_output = CommittedMaskRows(
+                        self.producer,
+                        ids,
+                        counts,
+                        sampling_info._areal_mask_versions,
+                        sampling_info._areal_mask_leases,
+                        1,
+                    )
+                return tokens
             logits_output.customized_info = {
                 "sampling_mask_refs": publish_sampling_masks(
                     self.producer,

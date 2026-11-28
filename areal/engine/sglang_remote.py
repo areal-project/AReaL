@@ -44,6 +44,30 @@ from areal.utils.sglang_image import image_request_kwargs
 logger = getLogger("SGLangRemote")
 
 
+def _dspark_server_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Translate AReaL options to the SGLang 0.5.20 CLI."""
+    result = dict(args)
+    for old, new in (
+        ("cuda_graph_max_bs", "cuda_graph_max_bs_decode"),
+        ("cuda_graph_bs", "cuda_graph_bs_decode"),
+        ("mamba_scheduler_strategy", "mamba_radix_cache_strategy"),
+    ):
+        if old in result:
+            value = result.pop(old)
+            if value is not None:
+                if new in result and result[new] != value:
+                    raise ValueError(f"Conflicting SGLang options: {old} and {new}")
+                result[new] = value
+    for removed in (
+        "enable_ep_moe",
+        "torchao_config",
+        "enable_nan_detection",
+    ):
+        if result.pop(removed, None):
+            raise ValueError(f"SGLang 0.5.20 no longer supports {removed}")
+    return result
+
+
 def _has_isolated_device_namespace(
     env: Mapping[str, str], gpus_per_server: int
 ) -> bool:
@@ -664,6 +688,29 @@ class SGLangBackend:
         server_args.pop("_sampling_mask_retained_versions", None)
         if sampling_mask_top_k is not None:
             server_args["skip_server_warmup"] = True
+        dspark = server_args.get("speculative_algorithm") == "DSPARK"
+        if dspark and server_args.get("enable_memory_saver"):
+            # The actor refreshes target weights only. Preserve the frozen draft
+            # when SGLang releases its weight allocations between rollouts.
+            server_args["enable_draft_weights_cpu_backup"] = True
+        joint_dspark = sampling_mask_top_k is not None and dspark
+        if joint_dspark:
+            from areal.engine.sglang_sampling_mask_plugin import (
+                JOINT_DSPARK,
+                integration_version,
+            )
+
+            if integration_version() != "0.5.20":
+                raise ValueError(
+                    "DSpark sampling-mask verification requires SGLang 0.5.20"
+                )
+            server_args = _dspark_server_args(server_args)
+            server_args["speculative_algorithm"] = JOINT_DSPARK
+            if (
+                server_args.get("enable_dp_attention")
+                and server_args.get("dp_size", 1) > 1
+            ):
+                server_args["enable_dp_lm_head"] = True
         cmd = SGLangConfig.build_cmd_from_args(server_args)
         _env = self.build_server_env(os.environ)
         _env.setdefault("PYTHONFAULTHANDLER", "1")
@@ -672,6 +719,8 @@ class SGLangBackend:
             _env["AREAL_SAMPLING_MASK_TRANSFER"] = "1"
             _env["AREAL_SAMPLING_MASK_TOP_K"] = str(sampling_mask_top_k)
             _env["AREAL_SAMPLING_MASK_RECEIVERS"] = str(sampling_mask_receivers)
+        if joint_dspark:
+            _env["SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"] = "0"
         if awex_transfer_rank_base is not None:
             _env["AWEX_TRANSFER_RANK_BASE"] = str(awex_transfer_rank_base)
 
@@ -721,7 +770,7 @@ class SGLangBackend:
             if awex_meta_addr:
                 _env["AWEX_META_SERVER_ADDR"] = awex_meta_addr
             logger.info("AWEX mode: using awex_sglang_plugin entry, cmd=%s", cmd[:4])
-        elif theta_native:
+        elif theta_native or joint_dspark:
             # The pinned Theta fork exposes the native distributed-update API.
             # AReaL's v2 scheduler wrapper targets a different SGLang API and
             # must not be imported for this opt-in, non-AWEX rollout path.
@@ -731,7 +780,7 @@ class SGLangBackend:
                 else c
                 for c in cmd
             ]
-            logger.info("Theta mode: using native SGLang entry, cmd=%s", cmd[:4])
+            logger.info("Using native SGLang entry, cmd=%s", cmd[:4])
 
         from areal.engine.sglang_model_patches import wrap_server_command
 

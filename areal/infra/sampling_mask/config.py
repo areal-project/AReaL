@@ -16,8 +16,10 @@ def configure(config) -> None:
         "sglang:"
     ) or not config.actor.backend.startswith("megatron:"):
         raise ValueError("sampling_mask_transfer requires SGLang + Megatron")
-    if config.sglang.speculative_algorithm:
-        raise ValueError("sampling_mask_transfer does not support speculative decoding")
+    if config.sglang.speculative_algorithm not in (None, "", "DSPARK"):
+        raise ValueError(
+            "sampling_mask_transfer supports only DSPARK speculative decoding"
+        )
     if (
         config.actor.use_score_centering
         or config.actor.use_sapo_loss
@@ -54,6 +56,12 @@ def configure(config) -> None:
             )
         if not 0 < sampling.top_p <= 1 or sampling.top_k == 0:
             raise ValueError("Invalid sampling_mask_transfer top_p/top_k")
+        if config.sglang.speculative_algorithm == "DSPARK" and (
+            sampling.seed is not None or sampling.top_k == 1
+        ):
+            raise ValueError(
+                "DSpark joint verification requires unseeded, stochastic sampling"
+            )
         sampling._sampling_mask_transfer = True
     from areal.api.alloc_mode import ModelAllocation
 
