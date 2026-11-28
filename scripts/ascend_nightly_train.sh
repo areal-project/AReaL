@@ -56,9 +56,37 @@ log_dir="$work/logs/$run_user/$experiment/nightly"
 mkdir -p "$log_dir"
 # The controller opens main.log in append mode. Follow it from the first line.
 touch "$log_dir/main.log"
-python -m "$entry" "${args[@]}" >"$work/console.log" 2>&1 &
+python -u -m "$entry" "${args[@]}" >"$work/console.log" 2>&1 &
 trainer_pid=$!
-tail --pid="$trainer_pid" -n +1 -f "$log_dir/main.log"
+(
+    previous_main_size=-1
+    previous_console_size=0
+    quiet_minutes=0
+    while sleep 60 && kill -0 "$trainer_pid" 2>/dev/null; do
+        main_size=$(stat -c %s "$log_dir/main.log")
+        console_size=$(stat -c %s "$work/console.log")
+        if [[ "$main_size" == "$previous_main_size" ]]; then
+            quiet_minutes=$((quiet_minutes + 1))
+            echo "Trainer PID $trainer_pid: main.log unchanged ($main_size bytes), console.log $console_size bytes"
+            if [[ "$console_size" != "$previous_console_size" ]]; then
+                tail -n 10 "$work/console.log"
+            fi
+            if (( quiet_minutes == 5 || quiet_minutes == 6 )); then
+                echo "Controller stack after $quiet_minutes quiet minutes:"
+                timeout 15s py-spy dump --nonblocking --pid "$trainer_pid" ||
+                    echo "Could not sample the controller stack (status $?)."
+            fi
+        else
+            quiet_minutes=0
+        fi
+        previous_main_size=$main_size
+        previous_console_size=$console_size
+    done
+) &
+monitor_pid=$!
+tail --pid="$trainer_pid" -n +1 -F "$log_dir/main.log"
+kill "$monitor_pid" 2>/dev/null || true
+wait "$monitor_pid" 2>/dev/null || true
 wait "$trainer_pid" || {
     status=$?
     echo "Training exited with status $status. Last trainer console messages:" >&2
