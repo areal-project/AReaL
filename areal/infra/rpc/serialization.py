@@ -100,9 +100,9 @@ class SerializedTensor(BaseModel):
         if cpu_tensor.dtype is torch.bfloat16:
             storage_tensor = cpu_tensor.to(torch.float32)
 
-        # Convert to bytes and encode as base64
-        buffer = storage_tensor.numpy().tobytes()
-        data_b64 = base64.b64encode(buffer).decode("utf-8")
+        # b64encode reads the contiguous array's raw buffer directly.
+        contiguous = np.ascontiguousarray(storage_tensor.numpy())
+        data_b64 = base64.b64encode(contiguous).decode("utf-8")
 
         return cls(
             data=data_b64,
@@ -203,8 +203,7 @@ class SerializedNDArray(BaseModel):
             raise ValueError(msg)
 
         contiguous = np.ascontiguousarray(array)
-        buffer = contiguous.tobytes()
-        data_b64 = base64.b64encode(buffer).decode("utf-8")
+        data_b64 = base64.b64encode(contiguous).decode("utf-8")
         return cls(data=data_b64, shape=list(array.shape), dtype=array.dtype.str)
 
     def to_array(self) -> np.ndarray:
