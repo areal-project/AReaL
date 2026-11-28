@@ -1983,6 +1983,49 @@ class PPOActorConfig(TrainEngineConfig):
             not self.use_decoupled_loss and self.recompute_logprob
         )
 
+    def _validate_score_centering_backend(self) -> None:
+        """Reject backends and modes the SC head selection cannot score.
+
+        FSDP keeps its own engine-side guard on sequence parallelism. Megatron
+        actors are supported across data / tensor / pipeline / context / expert
+        parallelism: pipeline stages only move activations, so the last stage still
+        holds one logit row per generated token; context parallelism slices those
+        rows per rank and the engine slices the sampler heads the same way before
+        scoring. Only modes that destroy the row-to-head alignment are rejected.
+        """
+        if self.enable_tree_training:
+            raise ValueError(
+                "Score centering does not support tree training: packed tree "
+                "logits do not carry one row per generated token."
+            )
+        if self.is_critic:
+            raise ValueError(
+                "Score centering requires an actor: the correction scores the "
+                "sampler's top-k heads against the policy logits."
+            )
+        if self.backend.startswith("fsdp:"):
+            return
+        if not self.backend.startswith("megatron:"):
+            raise ValueError(
+                "Score centering supports fsdp:* and megatron:* actors; got "
+                f"backend={self.backend!r}."
+            )
+        if self.megatron.enable_mtp_training:
+            raise ValueError(
+                "Score centering does not support Megatron MTP training: the MTP "
+                "head scores extra label rows that carry no sampler top-k. Set "
+                "actor.megatron.enable_mtp_training=false or disable "
+                "use_score_centering."
+            )
+        if self.megatron.enable_chunked_logits:
+            raise ValueError(
+                "Score centering needs full logits to score the sampler's top-k "
+                "heads, but actor.megatron.enable_chunked_logits=true never "
+                "materializes them (the chunked LM head returns log-probs and "
+                "entropy only). Set actor.megatron.enable_chunked_logits=false "
+                "(and lm_head_loss_chunk_size=0) or disable use_score_centering."
+            )
+
     def __post_init__(self):
         """Validate PPO actor configuration."""
         from areal.utils.constants import ProxLogpMethod
@@ -2103,12 +2146,7 @@ class PPOActorConfig(TrainEngineConfig):
             )
         # SC supports token-wise REINFORCE with an optional TIS cap only.
         if self.use_score_centering:
-            if (
-                not self.backend.startswith("fsdp:")
-                or self.enable_tree_training
-                or self.is_critic
-            ):
-                raise ValueError("Score centering requires an ordinary FSDP actor.")
+            self._validate_score_centering_backend()
             if self.temperature != 1.0 or self.recompute_logprob:
                 raise ValueError(
                     "Score centering requires temperature=1 and "

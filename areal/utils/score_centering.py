@@ -58,28 +58,6 @@ def validate_heads(ids, logprobs, count: int, width: int) -> None:
             raise ValueError("Sampler head probability mass exceeds one.")
 
 
-def parse_sampler_heads(meta: dict, output_tokens: list[int]):
-    """Read SGLang's standard [logprob, token_id, text] top-logprob rows."""
-    rows = meta.get("output_top_logprobs")
-    if not rows:
-        return None, None
-    try:
-        ids = [[entry[1] for entry in row] for row in rows]
-        logprobs = [[entry[0] for entry in row] for row in rows]
-        validate_heads(ids, logprobs, len(output_tokens), len(ids[0]))
-    except (IndexError, TypeError) as exc:
-        raise ValueError("Malformed SGLang sampler heads.") from exc
-    sampled = meta["output_token_logprobs"]
-    for row_ids, row_logprobs, sample in zip(ids, logprobs, sampled):
-        if sample[1] in row_ids:
-            head_logp = row_logprobs[row_ids.index(sample[1])]
-            if not math.isclose(head_logp, sample[0], rel_tol=1e-5, abs_tol=1e-5):
-                raise ValueError(
-                    "Sampled-token and head logprobs describe different distributions."
-                )
-    return ids, logprobs
-
-
 def trajectory_heads(response, width: int) -> dict[str, torch.Tensor]:
     """Pad prompt positions; keep sampler heads aligned to generated tokens."""
     validate_heads(
@@ -101,27 +79,120 @@ def trajectory_heads(response, width: int) -> dict[str, torch.Tensor]:
     return {"sampler_head_ids": ids, "sampler_head_logprobs": logprobs}
 
 
+#: A complete sampler head covers ~1.0 of the probability mass; far below that
+#: means the head set is incomplete and the correction sees a partial distribution.
+MIN_SAMPLER_HEAD_MASS = 0.9
+
+#: The head diagnostics reduce tensors to Python scalars, which forces a
+#: device-to-host sync. Sample them instead of paying that on every step.
+DIAG_INTERVAL = 100
+
+
+class HeadDiagnostics:
+    """Warn-once checks for the sampler heads of a score-centering run.
+
+    Both checks are sampled through :meth:`due`: the first micro-batch is always
+    inspected, later ones every ``interval`` calls, so a healthy step performs no
+    device synchronization. A check that fires disables itself, which keeps a
+    broken head loud without flooding the log.
+    """
+
+    def __init__(self, logger, interval: int = DIAG_INTERVAL):
+        self._logger = logger
+        self._interval = max(1, interval)
+        self._calls = 0
+        self._padding_warned = False
+        self._mass_warned = False
+
+    def due(self) -> bool:
+        """Return True when this step should pay the diagnostic sync."""
+        calls = self._calls
+        self._calls = calls + 1
+        return calls % self._interval == 0
+
+    def warn_padding(
+        self, sampler_logps: torch.Tensor, loss_mask: torch.Tensor | None
+    ) -> None:
+        """Warn once if generated positions carry padded or zero-mass head rows."""
+        if self._padding_warned:
+            return
+        rows = sampler_logps.reshape(-1, sampler_logps.shape[-1])
+        if loss_mask is not None:
+            keep = loss_mask.reshape(-1).bool()
+            if keep.numel() == rows.shape[0]:
+                rows = rows[keep]
+        if rows.numel() == 0:
+            return
+        pad_slots = int((rows <= -1e30).sum())
+        zero_rows = int((rows.exp().sum(-1) <= 0).sum())
+        if pad_slots or zero_rows:
+            self._padding_warned = True
+            self._logger.warning(
+                "score centering: %d padded head slots and %d zero-mass rows in "
+                "generated positions; sampler top-k is incomplete",
+                pad_slots,
+                zero_rows,
+            )
+
+    def warn_mass(self, metrics: dict[str, torch.Tensor]) -> None:
+        """Warn once when the sampler heads cover too little probability mass."""
+        q_mass = metrics.get("q_mass")
+        if q_mass is None or self._mass_warned:
+            return
+        cover = float(q_mass.float().mean())
+        if cover >= MIN_SAMPLER_HEAD_MASS:
+            return
+        self._mass_warned = True
+        self._logger.warning(
+            "score centering: sampler top-k heads cover only %.3f of the sampler "
+            "probability mass (expected ~1.0); the correction is computed from an "
+            "incomplete head set. Check score_centering_top_k and that the sampler "
+            "and trainer share one vocabulary.",
+            cover,
+        )
+
+
 def selected_logprobs(
     logits: torch.Tensor,
     ids: torch.Tensor,
     chunk_size: int = 256,
     compute_entropy: bool = True,
+    vocab_size: int | None = None,
 ):
     """Selected log-probabilities using ordinary PyTorch autograd.
 
     Checkpoint row chunks to avoid saving full FP32 log-probabilities for
     backward. Full input logits remain live. Entropy is diagnostic-only.
+
+    ``vocab_size`` is the model vocabulary; a wider ``logits`` tensor carries
+    Megatron's padding columns, which are masked out so the normalization matches
+    the sampler's distribution and does not depend on the padding a given
+    parallelism degree happens to add.
     """
     if logits.ndim != 2 or ids.ndim != 2 or logits.shape[0] != ids.shape[0]:
         raise ValueError("Expected logits [N,V] and token IDs [N,K].")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive.")
+    if vocab_size is not None and not 0 < vocab_size <= logits.shape[-1]:
+        raise ValueError(
+            f"vocab_size must be in [1, {logits.shape[-1]}]; got {vocab_size}."
+        )
     dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
 
     def compute(chunk, indices):
-        logp = chunk.to(dtype).log_softmax(-1)
+        work = chunk.to(dtype)
+        valid = None
+        if vocab_size is not None and vocab_size < work.shape[-1]:
+            valid = torch.arange(work.shape[-1], device=work.device) < vocab_size
+            work = work.masked_fill(~valid, -torch.inf)
+        logp = work.log_softmax(-1)
         selected = logp.gather(-1, indices.long())
-        entropy = -(logp.exp() * logp).sum(-1).detach() if compute_entropy else None
+        entropy = None
+        if compute_entropy:
+            terms = logp.exp() * (
+                logp if valid is None else logp.masked_fill(~valid, 0)
+            )
+            entropy = -terms.sum(-1).detach()
         return selected, entropy
 
     if logits.shape[0] == 0:
@@ -309,6 +380,11 @@ def score_centering_logprobs(
         if tp_group is not None:
             raise ValueError("Vocabulary-parallel score centering requires vocab_size.")
         selected, entropy = selected_logprobs(logits, ids, chunk_size)
+    elif tp_group is None:
+        # Single device: the logits may still carry padding columns.
+        selected, entropy = selected_logprobs(
+            logits, ids, chunk_size, vocab_size=vocab_size
+        )
     else:
         selected, entropy = vocab_parallel_selected_logprobs(
             logits, ids, tp_group=tp_group, vocab_size=vocab_size, chunk_size=chunk_size

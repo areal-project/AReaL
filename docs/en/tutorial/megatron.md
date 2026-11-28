@@ -68,3 +68,41 @@ python3 examples/math/gsm8k_rl.py --config <megatron_config.yaml> \
     cluster.n_nodes=4 cluster.n_gpus_per_node=8 actor.path=Qwen/Qwen3-30B-A3B \
     actor.megatron.use_deterministic_algorithms=True
 ```
+
+## Score Centering
+
+Sampler and trainer log-probs drift apart whenever the two stacks disagree on a token:
+different precision, different MoE routing, or a rollout copy that lags behind the
+latest weights. Score Centering (SC) adds a detached head/tail centering term to a
+token-wise REINFORCE loss, which keeps the gradient anchored to the sampler distribution
+as the policy drifts; `sc_loss_mode=ppo_additive` keeps the clipped PPO surrogate and
+adds the correction instead.
+
+```yaml
+actor:
+    use_score_centering: true
+gconfig:
+    score_centering_top_k: 4
+```
+
+The sampler heads come from the vLLM rollout backend, so SC requires
+`rollout.backend=vllm:...` and untruncated sampling: temperature 1, `top_p=1`,
+`top_k=-1`, no frequency penalty, neither greedy nor beam search. SC owns its head
+weighting, so leave `actor.rejection_sampling` and `actor.importance_sampling` unset and
+pick the weight with `actor.sc_mode` (`none` by default, `tis` or `mis` inside
+`sc_clip_low`/`sc_clip_high`). `actor.recompute_logprob` has to stay `False`. Tree
+training, critic actors, MTP training, chunked logits, SAPO/CISPO and the decoupled or
+M2PO losses are rejected when the config loads.
+
+Megatron actors score the heads on data, tensor, pipeline and expert parallelism; FSDP
+actors require `sp_size == tp_size == 1`.
+
+`score_centering_top_k` is the number of heads kept per token (`1..1024`) and raises
+`rollout.vllm.max_logprobs` when that value is smaller. On a Qwen3-30B-A3B MoE run,
+`k=4` showed no measurable wall-clock cost and about 0.4 MB/step of extra transport.
+
+The correction logs as `sc_correction` and `sc_loss_term`, next to `sc_rho`: the ratio
+of sampler to trainer probability mass outside the top-k head. It is 1.0 when the two
+agree and grows with the drift, so check it before enabling SC. Above roughly 1.5 to 2,
+together with `kl_div_direct` above ~0.05, there is drift worth correcting; near 1.0 the
+correction has nothing to do.

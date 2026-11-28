@@ -161,6 +161,7 @@ from areal.utils.lock import DistributedLock
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
+from areal.utils.score_centering import HeadDiagnostics
 from areal.utils.seeding import get_seed
 
 logger = logging.getLogger("MegatronEngine")
@@ -180,6 +181,25 @@ if TYPE_CHECKING:
 # rewriting) collapse to the same canonical form.
 _LAYER_IDX_RE = re.compile(r"\.layers\.\d+\.")
 _EXPERT_NUM_RE = re.compile(r"\.(weight|bias)\d+$")
+
+
+def _cp_unpad_token_tensor(
+    value: torch.Tensor,
+    padded_cu_seqlens: torch.Tensor,
+    padding_length: int,
+    old_cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor:
+    """Gather CP-local token rows and unpad them back to the global row order.
+
+    Per-token tensors consumed by the loss (log-probs, the SC correction and its
+    diagnostics) all live on the same row axis, so they must share one transform.
+    """
+    return unpad_logits(
+        reassemble_cp_packed_logprobs(value, padded_cu_seqlens),
+        padding_length,
+        padded_cu_seqlens,
+        old_cu_seqlens,
+    )
 
 
 def _normalize_glu_param_name(name: str) -> str:
@@ -476,6 +496,7 @@ class MegatronEngine(TrainEngine):
             tensor_parallel.model_parallel_cuda_manual_seed(self.seed)
             self.own_global_group = True
         self.logger = logging.getLogger(f"[MegatronEngine Rank {dist.get_rank()}]")
+        self._sc_diagnostics = HeadDiagnostics(self.logger)
         self._context_and_model_parallel_group = None
         self._init_context_and_model_parallel_group()
         # This is needed for barrier synchronization when models are moved to CPU
@@ -1638,6 +1659,20 @@ class MegatronEngine(TrainEngine):
                     cp_inputs["_cp_padded_cu_seqlens"] = padded_cu_seqlens
                     cp_inputs["_cp_padding_length"] = mb_input.padding_length
                     cp_inputs["_cp_old_cu_seqlens"] = mb_input.old_cu_seqlens
+                    # Heads and the loss mask follow the label split, so they are
+                    # taken from the padded layout that padded_cu_seqlens indexes.
+                    for key in (
+                        "sampler_head_ids",
+                        "sampler_head_logprobs",
+                        "loss_mask",
+                    ):
+                        value = mb_input.padded_mb.get(key)
+                        if value is not None:
+                            cp_inputs[f"_cp_local_{key}"] = (
+                                split_packed_seqs_for_context_parallel(
+                                    value, padded_cu_seqlens
+                                )
+                            )
                     return output, functools.partial(_process_output, cp_inputs)
                 else:
                     output = unpad_logits(
@@ -3658,6 +3693,12 @@ class MegatronEngine(TrainEngine):
                 "Tree training with critic model is not supported yet."
             )
         if not self.config.is_critic:
+            if getattr(self.config, "use_score_centering", False):
+                # The tree and chunked-output branches never reach the scoring
+                # helper, so check the modes before them.
+                self._ensure_score_centering_supported()
+            # Score centering injects its correction into the loss callback.
+            sc_kwargs: dict[str, Any] = {}
             if self.enable_tree_training:
                 # Handle dummy trie (empty tree for DP synchronization)
                 # When trie has no sequences, return zero loss with grad connection
@@ -3718,19 +3759,26 @@ class MegatronEngine(TrainEngine):
                     vocab_norm_logits = torch.linalg.vector_norm(
                         output.detach(), dim=-1, dtype=torch.float32
                     )
-                    logprobs, entropy = gather_logprobs_entropy(
-                        output,
-                        labels,
-                        temperature=self.config.temperature,
-                        tp_group=mpu.get_tensor_model_parallel_group()
-                        if mpu.get_tensor_model_parallel_world_size() > 1
-                        else None,
-                        chunk_size=self.config.logprobs_chunk_size,
-                        reuse_logits=_reuse_chunked_logits_storage(
-                            self.mcore_config.enable_chunked_logits,
-                            self.mcore_config.entropy_requires_grad,
-                        ),
-                    )
+                    if getattr(self.config, "use_score_centering", False):
+                        # SC selects the sampler's heads out of the same logits, so it
+                        # must run before any destructive logits reuse.
+                        logprobs, entropy, sc_kwargs = self._score_centering_logprobs(
+                            output, inputs, labels
+                        )
+                    else:
+                        logprobs, entropy = gather_logprobs_entropy(
+                            output,
+                            labels,
+                            temperature=self.config.temperature,
+                            tp_group=mpu.get_tensor_model_parallel_group()
+                            if mpu.get_tensor_model_parallel_world_size() > 1
+                            else None,
+                            chunk_size=self.config.logprobs_chunk_size,
+                            reuse_logits=_reuse_chunked_logits_storage(
+                                self.mcore_config.enable_chunked_logits,
+                                self.mcore_config.entropy_requires_grad,
+                            ),
+                        )
                 if cp_padded_cu_seqlens is not None:
                     logprobs = reassemble_cp_packed_logprobs(
                         logprobs, cp_padded_cu_seqlens
@@ -3788,6 +3836,26 @@ class MegatronEngine(TrainEngine):
                         cp_padded_cu_seqlens,
                         cp_old_cu_seqlens,
                     )
+                    # Per-token scalars for the loss take the same layout
+                    # transform as logprobs: gather the CP chunks, then unpad.
+                    if sc_kwargs.get("sc_correction") is not None:
+                        sc_kwargs["sc_correction"] = _cp_unpad_token_tensor(
+                            sc_kwargs["sc_correction"],
+                            cp_padded_cu_seqlens,
+                            cp_padding_length,
+                            cp_old_cu_seqlens,
+                        )
+                        # Logged against the global loss mask, so the diagnostics
+                        # need the same transform.
+                        metrics = sc_kwargs.get("sc_metrics")
+                        if metrics:
+                            for metric_key, metric_value in metrics.items():
+                                metrics[metric_key] = _cp_unpad_token_tensor(
+                                    metric_value,
+                                    cp_padded_cu_seqlens,
+                                    cp_padding_length,
+                                    cp_old_cu_seqlens,
+                                )
                     inputs = {
                         k: v for k, v in inputs.items() if not k.startswith("_cp_")
                     }
@@ -3799,6 +3867,7 @@ class MegatronEngine(TrainEngine):
                 vocab_max_logits=vocab_max_logits,
                 vocab_mean_logits=vocab_mean_logits,
                 vocab_norm_logits=vocab_norm_logits,
+                **sc_kwargs,
             )
         else:
             values = output.squeeze(-1)
@@ -3811,6 +3880,145 @@ class MegatronEngine(TrainEngine):
         assert total_loss_weight is not None
         loss_scale = local_weight / total_loss_weight * loss_multiplier
         return loss * loss_scale
+
+    def _ensure_score_centering_supported(self) -> None:
+        """Refuse the modes the head selection cannot score, once per engine.
+
+        The config layer rejects the same modes; repeating the check here keeps a
+        hand-built engine config from training with a zero correction.
+        """
+        if getattr(self, "_sc_support_checked", False):
+            return
+        if self.enable_tree_training:
+            raise ValueError(
+                "Score centering does not support tree training: packed tree "
+                "logits do not carry one row per generated token."
+            )
+        if self.mcore_config.enable_mtp_training:
+            raise ValueError(
+                "Score centering does not support Megatron MTP training: the MTP "
+                "head scores extra label rows that carry no sampler top-k. Set "
+                "actor.megatron.enable_mtp_training=false."
+            )
+        if self.mcore_config.enable_chunked_logits:
+            raise ValueError(
+                "Score centering needs full logits to score the sampler's top-k "
+                "heads, but actor.megatron.enable_chunked_logits=true never "
+                "materializes them. Set it to false (and lm_head_loss_chunk_size=0) "
+                "or disable use_score_centering."
+            )
+        self._sc_support_checked = True
+
+    def _score_centering_logprobs(
+        self,
+        logits: torch.Tensor,
+        inputs: dict[str, Any],
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Sampled log-probs, entropy and SC kwargs for one Megatron micro-batch.
+
+        Args:
+            logits: ``[rows, vocab_local]`` logits of this micro-batch; under
+                tensor parallelism each rank holds one vocabulary shard.
+            inputs: Micro-batch tensors; the sampler heads and the loss mask are
+                read from the ``_cp_local_*`` copies when context parallelism is
+                active, otherwise from the packed originals.
+            labels: ``[rows]`` next-token labels.
+
+        Returns:
+            ``(logprobs, entropy, sc_kwargs)`` for the actor loss.
+
+        """
+        from areal.utils.score_centering import (
+            build_weight_fn,
+            score_centering_logprobs,
+        )
+
+        self._ensure_score_centering_supported()
+        if self.config.temperature != 1.0:
+            raise ValueError(
+                "Score centering requires temperature=1 to score the sampler's "
+                f"distribution; got temperature={self.config.temperature}."
+            )
+        ids = inputs.get("_cp_local_sampler_head_ids")
+        if ids is None:
+            ids = inputs.get("sampler_head_ids")
+        q = inputs.get("_cp_local_sampler_head_logprobs")
+        if q is None:
+            q = inputs.get("sampler_head_logprobs")
+        loss_mask = inputs.get("_cp_local_loss_mask")
+        if loss_mask is None:
+            loss_mask = inputs.get("loss_mask")
+        if ids is None or q is None:
+            missing = "sampler_head_ids" if ids is None else "sampler_head_logprobs"
+            raise ValueError(
+                "use_score_centering=True but this Megatron micro-batch carries no "
+                f"sampler top-k heads (missing {missing}); mb_input keys="
+                f"{sorted(inputs)[:18]}. Check that the workflow propagates "
+                "sampler_head_ids / sampler_head_logprobs for every generated token."
+            )
+        if ids.ndim != 2 or ids.shape != q.shape:
+            raise ValueError(
+                "Packed sampler heads must be [rows, K] with matching shapes; got "
+                f"ids={tuple(ids.shape)}, logprobs={tuple(q.shape)}."
+            )
+        if ids.shape[0] != logits.shape[0]:
+            raise ValueError(
+                "Score centering needs one sampler-head row per logit row; got "
+                f"{ids.shape[0]} head rows for {logits.shape[0]} logit rows. "
+                "This means the heads lost their alignment with the packed tokens."
+            )
+        if labels.numel() != logits.shape[0]:
+            raise ValueError(
+                "Score centering needs one label per logit row; got "
+                f"{labels.numel()} labels for {logits.shape[0]} rows."
+            )
+        diagnose = self._sc_diagnostics.due()
+        if diagnose:
+            self._sc_diagnostics.warn_padding(q, loss_mask)
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        # VLMs nest vocab_size under text_config; lang_config() unwraps it.
+        vocab_size = int(getattr(lang_config(self.hf_config), "vocab_size", 0)) or None
+        if tp_size > 1:
+            if vocab_size is None:
+                raise ValueError(
+                    "Score centering cannot score the sampler heads: the model "
+                    "config exposes no vocab_size, so the tensor-parallel shards "
+                    "cannot be checked. Set actor.path to a config with vocab_size "
+                    "or disable use_score_centering."
+                )
+            # A shard narrower than the vocabulary would mis-score head ids.
+            covered = logits.shape[-1] * tp_size
+            if covered < vocab_size:
+                raise ValueError(
+                    "Score centering cannot score the sampler heads: the tp shards "
+                    f"cover {covered} ids but the model vocabulary is {vocab_size}."
+                )
+        sc_metrics: dict[str, torch.Tensor] = {}
+        logprobs, entropy, correction = score_centering_logprobs(
+            logits,
+            labels.reshape(-1),
+            ids,
+            q,
+            chunk_size=self.config.logprobs_chunk_size,
+            # tp>1: the logits are shards, so both arguments reach the reduction.
+            tp_group=mpu.get_tensor_model_parallel_group() if tp_size > 1 else None,
+            # Padding columns exist at every degree, so always normalize them out.
+            vocab_size=vocab_size,
+            weight_fn=build_weight_fn(
+                self.config.sc_mode,
+                self.config.sc_clip_low,
+                self.config.sc_clip_high,
+            ),
+            metrics_out=sc_metrics,
+        )
+        if diagnose:
+            self._sc_diagnostics.warn_mass(sc_metrics)
+        return (
+            logprobs,
+            entropy,
+            {"sc_correction": correction, "sc_metrics": sc_metrics},
+        )
 
     def _build_per_token_loss_output(
         self,

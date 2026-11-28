@@ -14,6 +14,7 @@ from areal.api.cli_args import (
 )
 from areal.api.io_struct import ModelResponse
 from areal.trainer.ppo.actor import grpo_loss_fn
+from areal.utils import logging
 from areal.utils.data import (
     concat_batch,
     pack_tensor_dict,
@@ -21,6 +22,7 @@ from areal.utils.data import (
     split_padded_tensor_dict_into_mb_list,
 )
 from areal.utils.score_centering import (
+    HeadDiagnostics,
     build_weight_fn,
     score_centering_correction,
     score_centering_logprobs,
@@ -105,6 +107,35 @@ def test_reference_values_and_gradients_match_dense(dtype, chunk, width):
         rtol=tol if dtype != torch.bfloat16 else 0.008,
     )
     assert not entropy.requires_grad
+
+
+def test_selected_logprobs_masks_padded_vocabulary_when_vocab_size_set():
+    """Test that padding columns are excluded from the dense normalization.
+
+    Megatron pads the LM head to a multiple of ``128 * tp``, so the same policy
+    emits wider logits at some parallelism degrees. Normalizing over the model
+    vocabulary keeps the log-probs independent of that padding.
+    """
+    generator = torch.Generator().manual_seed(11)
+    rows, width, vocab, k = 5, 32, 24, 3
+    logits = torch.randn(rows, width, generator=generator, dtype=torch.float64)
+    ids = logits[:, :vocab].softmax(-1).topk(k, dim=-1).indices
+
+    masked, _ = selected_logprobs(logits, ids, vocab_size=vocab)
+    expected = logits[:, :vocab].log_softmax(-1).gather(-1, ids)
+    torch.testing.assert_close(masked, expected, rtol=1e-12, atol=1e-14)
+
+    unmasked, _ = selected_logprobs(logits, ids)
+    assert not torch.allclose(unmasked, masked), "padding columns changed nothing"
+
+
+def test_selected_logprobs_rejects_vocab_size_wider_than_logits():
+    """Test that a vocabulary wider than the logits is refused."""
+    logits = torch.randn(2, 8)
+    ids = torch.zeros(2, 1, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="vocab_size must be"):
+        selected_logprobs(logits, ids, vocab_size=9)
 
 
 def test_on_policy_correction_has_zero_value_and_gradient():
@@ -333,6 +364,7 @@ def test_actor_alignment_and_fsdp_loss_match_dense_with_padding(width, tis_cap):
     engine.enable_tree_training = False
     engine.parallel_helper = SimpleNamespace(tp_size=1, sp_size=1)
     engine.model_config = SimpleNamespace(vocab_size=17)
+    engine._sc_diagnostics = HeadDiagnostics(logging.getLogger("FSDPEngineTest"))
     for item in mbs:
         inputs, ctx = engine._prepare_mb_inputs(item)
         assert "sampler_head_ids" not in inputs
@@ -442,6 +474,7 @@ def test_missing_heads_raise_value_error_not_keyerror():
     engine.enable_tree_training = False
     engine.parallel_helper = SimpleNamespace(tp_size=1, sp_size=1)
     engine.model_config = SimpleNamespace(vocab_size=17)
+    engine._sc_diagnostics = HeadDiagnostics(logging.getLogger("FSDPEngineTest"))
 
     mb = {
         "input_ids": torch.arange(4)[None],
