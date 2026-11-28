@@ -649,7 +649,8 @@ def sapo_loss_fn(
             log_ratio, advantages, loss_mask, cu_seqlens
         )
     elif importance_sampling_level == "token":
-        ratio = torch.exp(log_ratio)
+        masked_log_ratio = torch.where(loss_mask, log_ratio, 0.0)
+        ratio = torch.where(loss_mask, masked_log_ratio.exp(), 0.0)
     else:
         raise ValueError(
             f"Invalid importance_sampling_level: {importance_sampling_level}. "
