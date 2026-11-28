@@ -29,6 +29,10 @@ def main(args):
     )
     eval_workflow_kwargs = workflow_kwargs.copy()
     eval_workflow_kwargs["temperature"] = 0.6
+    if config.gconfig.score_centering_top_k:
+        workflow_kwargs["extra_body"] = config.gconfig.to_openai_args_dict()[
+            "extra_body"
+        ]
 
     with PPOTrainer(
         config,

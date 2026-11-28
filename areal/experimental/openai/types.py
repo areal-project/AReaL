@@ -14,6 +14,7 @@ from openai.types.responses.response_input_param import ResponseInputParam
 from areal.api import ModelResponse
 from areal.engine.r3.preprocess import preprocess_routed_experts_batch
 from areal.utils.data import RolloutGroup, concat_padded_tensors, get_batch_size
+from areal.utils.score_centering import trajectory_heads
 
 
 class ApiType(str, Enum):
@@ -45,6 +46,7 @@ class InteractionWithTokenLogpReward:
     chat_template_type: str = "hf"
     r3_num_moe_layers: int | None = None
     r3_topk: int | None = None
+    score_centering_top_k: int = 0
     _cache: dict[str, Any] | None = None
 
     # Multimodal training data prepared from the complete prompt for this turn.
@@ -282,6 +284,28 @@ class InteractionWithTokenLogpReward:
         if routed_experts is not None and r3_routing_valid is not None:
             result["routed_experts"] = routed_experts
             result["r3_routing_valid"] = r3_routing_valid
+        heads = (
+            trajectory_heads(resp, self.score_centering_top_k)
+            if self.score_centering_top_k
+            else None
+        )
+        if self.chat_template_type == "concat" and self.parent is not None:
+            parent_heads = parent_res.get("sampler_head_ids")
+            if (heads is None) != (parent_heads is None):
+                raise ValueError(
+                    "Score centering must be configured consistently across concatenated turns."
+                )
+            if heads is not None:
+                if parent_heads.shape[-1] != self.score_centering_top_k:
+                    raise ValueError(
+                        "Sampler head width changed between concatenated turns."
+                    )
+                heads = {
+                    k: torch.cat([parent_res[k].squeeze(0), v[parent_len:]])
+                    for k, v in heads.items()
+                }
+        if heads is not None:
+            result.update({k: v.unsqueeze(0) for k, v in heads.items()})
         if self.mm_token_type_ids is not None or self.multi_modal_input is not None:
             mm_token_type_ids = self.mm_token_type_ids or [0] * resp.input_len
             if len(mm_token_type_ids) != resp.input_len:
@@ -391,6 +415,14 @@ def concat_tensor_interactions(
         batches.extend(tensors)
         counts.append(sum(get_batch_size(t) for t in tensors))
         rewards.append(_interaction_rollout_reward(member))
+    widths = {
+        batch["sampler_head_ids"].shape[-1] if "sampler_head_ids" in batch else 0
+        for batch in batches
+    }
+    if len(widths) > 1:
+        # Generic padding also pads trailing dimensions. Padding K would add
+        # fake head candidates and change the score-centering gradient.
+        raise ValueError("Batched agent interactions must share score_centering_top_k.")
     result = concat_padded_tensors(batches)
     result["rollout_group"] = RolloutGroup(tuple(counts), tuple(rewards))
     return result

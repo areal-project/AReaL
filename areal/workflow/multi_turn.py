@@ -12,6 +12,7 @@ from areal.api import AsyncRewardWrapper, InferenceEngine, ModelRequest, Rollout
 from areal.api.cli_args import GenerationHyperparameters
 from areal.utils import logging, stats_tracker
 from areal.utils.hf_utils import apply_chat_template
+from areal.utils.score_centering import trajectory_heads
 
 logger = logging.getLogger("MultiTurnWorkflow")
 
@@ -59,6 +60,7 @@ class MultiTurnWorkflow(RolloutWorkflow):
         # Enforces `n_samples=1`
         # Placeholders for the results
         seq, logprobs, loss_mask, versions, turn_ids = [], [], [], [], []
+        sampler_heads: list[dict[str, torch.Tensor]] = []
         messages = data["messages"]
         # Convert the prompt into input_ids
         input_ids: list[int] = apply_chat_template(
@@ -97,14 +99,16 @@ class MultiTurnWorkflow(RolloutWorkflow):
                 **data,
             )
             # Amend results
-            input_len = len(resp.input_tokens) - len(seq)
-            assert len(seq) == 0 or resp.input_tokens[:-input_len] == seq, (
-                seq,
-                resp.input_tokens[:-input_len],
-                len(seq),
-                len(resp.input_tokens[:-input_len]),
-            )
-            seq += resp.input_tokens[-input_len:] + resp.output_tokens
+            previous_len = len(seq)
+            input_len = resp.input_len - previous_len
+            if input_len < 0 or resp.input_tokens[:previous_len] != seq:
+                raise ValueError(
+                    "Multi-turn prompts must preserve sampled token prefixes."
+                )
+            if self.gconfig.score_centering_top_k:
+                heads = trajectory_heads(resp, self.gconfig.score_centering_top_k)
+                sampler_heads.append({k: v[previous_len:] for k, v in heads.items()})
+            seq += resp.input_tokens[previous_len:] + resp.output_tokens
             logprobs += [0.0] * input_len + resp.output_logprobs
             loss_mask += [0] * input_len + [1] * resp.output_len
             versions += [-1] * input_len + resp.output_versions
@@ -139,4 +143,11 @@ class MultiTurnWorkflow(RolloutWorkflow):
             attention_mask=torch.ones(len(seq), dtype=torch.bool),
             is_truncated=torch.tensor(is_truncated, dtype=torch.bool),
         )
+        if sampler_heads:
+            res.update(
+                {
+                    k: torch.cat([turn[k] for turn in sampler_heads])
+                    for k in sampler_heads[0]
+                }
+            )
         return {k: v.unsqueeze(0) for k, v in res.items()}
