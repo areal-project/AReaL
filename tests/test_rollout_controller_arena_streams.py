@@ -41,7 +41,7 @@ def make_arena_stream_controller(
     controller._worker_role = "rollout"
     controller._callback_host = "127.0.0.1"
     controller._callback_port = 12345
-    controller._choose_worker = lambda: (SimpleNamespace(id="worker"), 0)
+    controller.workers = [SimpleNamespace(id="worker")]
     controller._staleness_manager = StalenessManager(
         controller,
         max_concurrent_rollouts=max_concurrent_rollouts,
@@ -98,10 +98,38 @@ async def test_arena_completion_feedback_covers_terminal_paths(outcome):
     else:
         await callback()
 
+    assert controller._stream_active[0] == 0
     assert loader.state_dict()["debt"]["a"] == int(outcome != "accepted")
     assert loader.next_arena_rollout(2)["stream"] == (
         "b" if outcome == "accepted" else "a"
     )
+
+
+@pytest.mark.asyncio
+async def test_arena_worker_selection_failure_releases_source_reservation():
+    """Selection errors still report rejection without inventing a GPU lease."""
+    controller = make_arena_stream_controller()
+    controller.workers = []
+    loader = make_arena_stream_loader()
+    task = _RemoteRolloutTaskInput(
+        task_id=0,
+        data=loader.next_arena_rollout(0),
+        workflow=None,
+        workflow_kwargs={},
+        should_accept_fn=None,
+        arena_stream_dataloader=loader,
+    )
+    controller.staleness_manager.on_rollout_enqueued()
+    controller.staleness_manager.on_rollout_submitted()
+
+    assert await controller._create_submit_callback(task)() is None
+
+    controller.scheduler.async_call_engine.assert_not_called()
+    assert controller.staleness_manager.get_stats().rejected == 1
+    assert controller.staleness_manager.get_stats().running == 0
+    assert not controller._stream_active
+    assert loader.state_dict()["debt"]["a"] == 1
+    assert loader.next_arena_rollout(1)["stream"] == "a"
 
 
 @pytest.mark.parametrize("dynamic_bs", [False, True])
