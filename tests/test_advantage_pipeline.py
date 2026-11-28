@@ -4,10 +4,11 @@
 
 import copy
 from dataclasses import asdict, replace
+from pathlib import Path
 
 import pytest
 import torch
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 from areal.api.cli_args import (
     AdvantageConfig,
@@ -436,3 +437,46 @@ def test_shaped_references_require_complete_group_metadata():
     )
     with pytest.raises(ValueError, match="complete trajectory metadata"):
         actor._compute_advantages(_batch(), meta)
+
+
+def test_group_reward_norm_without_batch_adv_norm_preserves_group_centered_advantages():
+    """Group-normalized GRPO configs must not shift zero-variance groups by length."""
+    examples_dir = Path(__file__).resolve().parents[1] / "examples"
+    for path in sorted(examples_dir.rglob("*.yaml")):
+        cfg = OmegaConf.load(path)
+        if not isinstance(cfg, DictConfig) or "actor" not in cfg:
+            continue
+        actor_cfg = cfg.actor
+        if not isinstance(actor_cfg, DictConfig):
+            continue
+        reward_norm = actor_cfg.get("reward_norm")
+        if (
+            isinstance(reward_norm, DictConfig)
+            and reward_norm.get("mean_level") == "group"
+        ):
+            adv_norm = actor_cfg.get("adv_norm")
+            assert adv_norm is None or (
+                adv_norm.get("mean_level") is None and adv_norm.get("std_level") is None
+            ), f"{path} stacks batch adv_norm on group reward_norm"
+
+    data = _batch((1.0, 0.0, 0.0, 0.0))
+    # Group 0: 1-token positive response, 4-token negative response.
+    # Group 1: two 2-token zero-variance responses.
+    data["loss_mask"] = torch.tensor(
+        [
+            [0, 0, 0, 0, 1],
+            [0, 1, 1, 1, 1],
+            [0, 0, 0, 1, 1],
+            [0, 0, 0, 1, 1],
+        ]
+    )
+    actor = _actor(
+        reward_norm=NormConfig(mean_level="group", std_level=None, group_size=2),
+        adv_norm=None,
+    )
+    result = actor._compute_advantages(data)
+    advantages = result["advantages"]
+
+    torch.testing.assert_close(advantages[0, 3], torch.tensor(0.5))
+    torch.testing.assert_close(advantages[1, :4], torch.full((4,), -0.5))
+    torch.testing.assert_close(advantages[2:], torch.zeros_like(advantages[2:]))

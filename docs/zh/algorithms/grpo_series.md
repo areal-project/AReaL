@@ -45,8 +45,7 @@ IcePop和KPop是token掩码策略，可以与上面列出的任意RL算法组合
 python3 examples/math/gsm8k_rl.py \
   --config examples/math/gsm8k_grpo.yaml \
   scheduler.type=local \
-  actor.adv_norm.mean_level=group \
-  actor.adv_norm.std_level=null
+  actor.reward_norm.std_level=null
 
 # GSPO (从GRPO配置)
 python3 examples/math/gsm8k_rl.py \
@@ -122,10 +121,12 @@ actor:
     group_size: ${gconfig.n_samples}
 ```
 
-**AReaL默认实践**：默认配置使用 `std_level: batch`
-进行优势归一化。这已成为AReaL团队在各种RL应用中的标准实践，从游戏AI（StarCraft）到LLM训练（RLHF、推理、agent设置）。虽然
-[Dr.GRPO](https://arxiv.org/abs/2503.20783) 建议使用 `std_level: null` 以获得潜在更好的性能，但我们保留
-`std_level: batch` 以保持向后兼容性。寻求Dr.GRPO风格行为的用户应设置 `actor.adv_norm.std_level=null`。
+**AReaL默认实践**：带 critic 的 PPO 使用 batch 级优势归一化（`actor.adv_norm` 配置为
+`mean_level: batch`、`std_level: batch`，且 `actor.reward_norm: null`）。分组相对算法（GRPO、Dr.GRPO、LitePPO、RLOO、GSPO、DAPO
+等）则通过 `actor.reward_norm` 在每个提示组内对结果奖励进行归一化，并将 `actor.adv_norm` 设为 `null`，避免按 token
+加权的 batch 归一化偏移已组内中心化的基线。虽然 [Dr.GRPO](https://arxiv.org/abs/2503.20783) 建议使用
+`std_level: null` 来省去组内标准差缩放，但标准 GRPO 配置默认使用 `reward_norm.std_level: group`；寻求
+Dr.GRPO 风格行为的用户应设置 `actor.reward_norm.std_level=null`。
 
 ### 裁剪策略（`actor.eps_clip*`）
 
@@ -152,18 +153,18 @@ actor:
 
 下表展示了如何通过设置适当的参数来配置每个算法：
 
-| 算法        | `adv_norm.mean_level` | `adv_norm.std_level` | `adv_norm.mean_leave1out` | `importance_sampling_level` | 特殊配置             |
-| ----------- | --------------------- | -------------------- | ------------------------- | --------------------------- | -------------------- |
-| **PPO**     | `batch`               | `batch`              | `false`                   | `token`                     | 需要critic模型。     |
-| **GRPO**    | `batch`               | `batch`              | `false`                   | `token`                     | -                    |
-| **Dr.GRPO** | `group`               | `null`               | `false`                   | `token`                     | -                    |
-| **LitePPO** | `group`               | `batch`              | `false`                   | `token`                     | -                    |
-| **RLOO**    | `group`               | `null`               | `true`                    | `token`                     | -                    |
-| **GSPO**    | `batch`               | `batch`              | `false`                   | `sequence`                  | -                    |
-| **DAPO**    | `batch`               | `batch`              | `false`                   | `token`                     | 非对称裁剪，动态采样              |
-| **SAPO**    | `batch`               | `batch`              | `false`                   | `token`                     | `use_sapo_loss=true`               |
-| **IcePop**  | `batch`               | `batch`              | `false`                   | `token`                     | `rejection_sampling.metric=ratio`  |
-| **KPop**    | `batch`               | `batch`              | `false`                   | `token`                     | `rejection_sampling.metric=binary_kl` |
+| 算法        | `reward_norm.mean_level` | `reward_norm.std_level` | `reward_norm.mean_leave1out` | `adv_norm`       | `importance_sampling_level` | 特殊配置                              |
+| ----------- | ------------------------ | ----------------------- | ---------------------------- | ---------------- | --------------------------- | ------------------------------------- |
+| **PPO**     | `null`                   | `null`                  | -                            | `batch`, `batch` | `token`                     | 需要critic模型。                      |
+| **GRPO**    | `group`                  | `group`                 | `false`                      | `null`           | `token`                     | -                                     |
+| **Dr.GRPO** | `group`                  | `null`                  | `false`                      | `null`           | `token`                     | -                                     |
+| **LitePPO** | `group`                  | `batch`                 | `false`                      | `null`           | `token`                     | -                                     |
+| **RLOO**    | `group`                  | `null`                  | `true`                       | `null`           | `token`                     | -                                     |
+| **GSPO**    | `group`                  | `group`                 | `false`                      | `null`           | `sequence`                  | -                                     |
+| **DAPO**    | `group`                  | `group`                 | `false`                      | `null`           | `token`                     | 非对称裁剪，动态采样                  |
+| **SAPO**    | `group`                  | `group`                 | `false`                      | `null`           | `token`                     | `use_sapo_loss=true`                  |
+| **IcePop**  | `group`                  | `group`                 | `false`                      | `null`           | `token`                     | `rejection_sampling.metric=ratio`     |
+| **KPop**    | `group`                  | `group`                 | `false`                      | `null`           | `token`                     | `rejection_sampling.metric=binary_kl` |
 
 **注意**："GRPO"行反映原始DeepSeekMath公式。AReaL的默认GRPO配置使用这些设置，但已移除长度归一化（见下文AReaL实现说明）。
 
@@ -192,7 +193,7 @@ $$
 
 ### RLOO (REINFORCE Leave-One-Out)
 
-RLOO通过平均**其他**采样响应的奖励（排除当前响应）来估计基线。这通过设置 `actor.adv_norm.mean_leave1out=true` 实现。
+RLOO通过平均**其他**采样响应的奖励（排除当前响应）来估计基线。这通过设置 `actor.reward_norm.mean_leave1out=true` 实现。
 
 $$ J_{\text{RLOO}}(\theta) = \mathbb{E}_{\substack{q \sim P(Q), \\ {o_i}_{i=1}^G
 \sim \pi_{\theta_{\text{old}}}(O \mid q)}} \left[ \frac{1}{G} \sum_{i=1}^G

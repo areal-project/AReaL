@@ -87,9 +87,7 @@ actor:
     mean_level: group
     std_level: group
     group_size: ${gconfig.n_samples}
-  adv_norm:
-    mean_level: batch
-    std_level: batch
+  adv_norm: null
   megatron:
     bridge_type: megatron-bridge
     use_bridge_for_update_weights: true
